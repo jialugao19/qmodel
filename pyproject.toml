@@ -1,0 +1,33 @@
+[build-system]
+requires = [
+  "setuptools>=61",
+  "wheel",
+  "pybind11>=2.10",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qmodel"
+version = "0.1.0"
+description = "Modular training and evaluation utilities extracted from AQ2.modeling"
+authors = [{name = "AQ2 Contributors"}]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "torch>=2.0",
+  "numpy",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qmodel*"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-cov",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
