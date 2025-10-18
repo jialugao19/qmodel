@@ -3,7 +3,7 @@ from torch.utils.data import Sampler
 from line_profiler import profile
 import numpy as np
 
-from AQ2.modeling.data.cpp.permute import Permute64
+from qmodel.data.cpp.permute import Permute64
 
 class CustomSampler(Sampler):
     def __init__(self, dataset, seed, shuffle=True, infinite=False):
@@ -29,7 +29,7 @@ class CustomSampler(Sampler):
 
     #         if not self.infinite:
     #             break
-    
+
     def set_start_iter(self, iteration: int):
         self.start = iteration
 

@@ -4,7 +4,7 @@ import torch
 from pathlib import Path
 from typing import Optional
 
-from AQ2.modeling.amp_scaler import MyScaler
+from qmodel.amp_scaler import MyScaler
 
 class CheckpointSaver:
     def __init__(self, root_dir: str, config, device=None):

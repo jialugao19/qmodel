@@ -9,8 +9,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qmodel"
 version = "0.1.0"
-description = "Modular training and evaluation utilities extracted from AQ2.modeling"
-authors = [{name = "AQ2 Contributors"}]
+description = "Modular training and evaluation utilities"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [

@@ -7,12 +7,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 
-from AQ2.modeling.data.sampler import CustomSampler
-from AQ2.modeling.data.collate import custom_collate_fn
-from AQ2.modeling.evaluator import Evaluator
-from AQ2.modeling.lr_scheduler import custom_scheduler
-from AQ2.modeling.eval_trainer import AsyncTrainer, SyncTrainer
-from AQ2.modeling.checkpoint import CheckpointSaver
+from qmodel.data.sampler import CustomSampler
+from qmodel.data.collate import custom_collate_fn
+from qmodel.evaluator import Evaluator
+from qmodel.lr_scheduler import custom_scheduler
+from qmodel.eval_trainer import AsyncTrainer, SyncTrainer
+from qmodel.checkpoint import CheckpointSaver
 
 from AQ2.utils.logger import logger
 

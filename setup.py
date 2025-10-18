@@ -6,7 +6,7 @@ from pybind11.setup_helpers import build_ext
 
 ext_modules = [
     Extension(
-        "qmodel.data.permute",
+        "qmodel.data.cpp.permute",
         ["qmodel/data/cpp/permute.cpp"],
         include_dirs=[
             pybind11.get_include(),

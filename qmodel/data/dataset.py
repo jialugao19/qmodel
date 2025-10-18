@@ -8,11 +8,10 @@ import os
 import json
 from numpy.lib import recfunctions as rfn
 
-from .TmpFeather import TmpFeather
 from line_profiler import profile
 
-from AQ2.utils.logger import logger
-from AQ2.modeling.data.cpp.permute import Permute64
+from qmodel.data.TmpFeather import TmpFeather
+from qmodel.data.cpp.permute import Permute64
 
 class DataStorage:
     data: np.memmap

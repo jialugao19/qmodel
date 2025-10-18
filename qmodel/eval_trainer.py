@@ -5,8 +5,8 @@ from typing import Callable, Protocol, Iterable
 import time
 from tqdm import tqdm
 
-from AQ2.modeling.amp_scaler import MyScaler
-from AQ2.modeling.profiler import MyProfiler
+from qmodel.amp_scaler import MyScaler
+from qmodel.profiler import MyProfiler
 
 class _AsyncBase:
     device: torch.device
