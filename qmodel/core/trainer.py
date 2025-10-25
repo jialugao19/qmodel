@@ -70,7 +70,7 @@ class Trainer(AsyncTrainer):
     def train(self):
         assert isinstance(self.dataloader, torch.utils.data.DataLoader)
         n_iter = min(len(self.dataloader), self.config.num_iters)
-        self.run(n_iter=n_iter, start=self.start_iter)
+        self.run(n_iter=n_iter, start=self.start_iter, use_tqdm=False)
         self.writer.close()
 
     def _pre_step(self, curr_it):
@@ -80,9 +80,13 @@ class Trainer(AsyncTrainer):
                 self.amp_scaler, curr_it
             )
 
-        if 0 and curr_it % self.config.eval_every == 0:
+        if self.config.eval_during and \
+            curr_it % self.config.eval_every == 0:
+
             torch.cuda.empty_cache()
-            metrics = self.evaluator.eval_single(curr_it)
+            metrics = self.evaluator.eval_partial(
+                curr_it, self.config.eval_during_num_iters
+            )
             torch.cuda.empty_cache()
 
             ret_col = self.config.ret_col_name

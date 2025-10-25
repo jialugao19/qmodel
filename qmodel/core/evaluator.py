@@ -51,6 +51,10 @@ class Evaluator:
         for it in files:
             self.eval_single(it, n_iter=self.config.evaluator.eval_all_num_iters)
 
+    def eval_partial(self, it: int, n_iter: int) -> dict:
+        res = self.eval_single(it, n_iter=n_iter)
+        return res
+
     def eval_single(self, it: int, n_iter=0) -> dict:
         config      = self.config
         device      = self.config.device
@@ -73,6 +77,7 @@ class Evaluator:
         )
         if n_iter == 0:
             n_iter = len(dataloader)
+        n_iter = min(n_iter, len(dataloader))
         res = inferencer.run(n_iter=n_iter)
         logger.info(f"finish running inference")
 
@@ -105,7 +110,7 @@ class Evaluator:
         global_ic = np.corrcoef(res_df['prediction'], res_df['target'])[0, 1]
         end_time = time.time()
 
-        logger.info(f"global IC: {global_ic:.5f}, computed IC in {end_time-start_time:.3f}s")
+        logger.info(f"global IC: {global_ic:.8f}, computed IC in {end_time-start_time:.3f}s")
 
         # save to feather
         os.makedirs(os.path.join(self.config.root_dir, "eval"), exist_ok=True)

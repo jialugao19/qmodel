@@ -57,10 +57,10 @@ def test_train():
     scaler1 = MyScaler(amp_dtype, dtype)
     scaler2 = MyScaler(amp_dtype, dtype)
 
-    profiler1 = MyProfiler(False, ProfilerConfig())
-    profiler2 = MyProfiler(False, ProfilerConfig())
-    profiler3 = MyProfiler(False, ProfilerConfig())
-    profiler4 = MyProfiler(False, ProfilerConfig())
+    profiler1 = MyProfiler(False, ProfilerConfig("none", ""))
+    profiler2 = MyProfiler(False, ProfilerConfig("none", ""))
+    profiler3 = MyProfiler(False, ProfilerConfig("none", ""))
+    profiler4 = MyProfiler(False, ProfilerConfig("none", ""))
 
     trainer1 = SyncTrainer(
         model1, dataloader1, nn.MSELoss(), optim1, sched1, scaler1, profiler1, device)

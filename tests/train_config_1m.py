@@ -76,6 +76,8 @@ class Config(QConfig):
     num_iters = 1 * 10**6 + 1
     save_every = 10000
     eval_every = 10000
+    eval_during = True
+    eval_during_num_iters = 200
 
     load_from_iter: Optional[int] = None
     log_every = 1000
@@ -86,15 +88,12 @@ class Config(QConfig):
 
     lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
     profiler: ProfilerConfig = ProfilerConfig(
-        profile_section="train",  # "train", "eval", "none"
+        profile_section="none",  # "train", "eval", "none"
         profile_dir=os.path.join(tensorboard_dir, "profile")
     )
     evaluator: EvalConfig = EvalConfig1(
         eval_checkpoint_iter=np.arange(0, 1_000_000, 10_000).tolist()[::-1][:1]
     )
-
-    # todo: complete the eval config, separate default value from qmodel.config
-
 
     def __post_init__(self):
         os.makedirs(self.root_dir, exist_ok=True)

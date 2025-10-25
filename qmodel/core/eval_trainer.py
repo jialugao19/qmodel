@@ -67,7 +67,7 @@ class _AsyncBase:
     def _post_step(self, res, buffer, target, other_meta, curr_it):
         raise NotImplementedError
 
-    def run(self, n_iter=99999999, start=0):
+    def run(self, n_iter=99999999, start=0, use_tqdm=True):
         assert self.valid, "Can only use once, re-init class"
         self.valid = False
         self._init()
@@ -79,7 +79,11 @@ class _AsyncBase:
         event2, event3 = torch.cuda.Event(), torch.cuda.Event()
         f1 = self.ex.submit(self._h2d_transfer)
 
-        for curr_it in tqdm(range(start, n_iter), initial=start):
+        if use_tqdm:
+            iters = tqdm(range(start, n_iter), initial=start)
+        else:
+            iters = range(start, n_iter)
+        for curr_it in iters:
             self._pre_step(curr_it)
             data, target, other_meta, finished = f1.result()
             if finished:
@@ -153,7 +157,7 @@ class _SyncBase:
     def _post_step(self, res, buffer, target, other_meta, curr_it):
         raise NotImplementedError
 
-    def run(self, n_iter=99999999, start=0):
+    def run(self, n_iter=99999999, start=0, use_tqdm=True):
         assert self.valid, "Can only use once, re-init class"
         self.valid = False
         self._init()
@@ -163,7 +167,12 @@ class _SyncBase:
 
         res = []
         it = iter(self.dataloader)
-        for curr_it in tqdm(range(start, n_iter), initial=start):
+
+        if use_tqdm:
+            iters = tqdm(range(start, n_iter), initial=start)
+        else:
+            iters = range(start, n_iter)
+        for curr_it in iters:
             data, target, other_meta = next(it)
             # print(data.ravel()[:3], target.ravel()[:3], other_meta[:3])
             self._pre_step(curr_it)

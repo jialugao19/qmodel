@@ -77,6 +77,8 @@ class QConfig:
     num_iters: int = field(init=False)
     save_every: int = field(init=False)
     eval_every: int = field(init=False)
+    eval_during: bool = field(init=False)
+    eval_during_num_iters: int = field(init=False)
 
 
     load_from_iter: Optional[int] = field(init=False)
