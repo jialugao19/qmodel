@@ -4,7 +4,10 @@ import torch
 import torch.nn as nn
 import unittest
 
-from qmodel.eval_trainer import AsyncInference, AsyncTrainer, SyncInference, SyncTrainer
+from qmodel.core.eval_trainer import AsyncInference, AsyncTrainer, SyncInference, SyncTrainer
+from qmodel.components.amp_scaler import MyScaler
+from qmodel.components.profiler import MyProfiler
+from qmodel.config import ProfilerConfig
 
 class Result(nn.Module):
     def forward(self, x):
@@ -51,8 +54,16 @@ def test_train():
     sched1 = torch.optim.lr_scheduler.ConstantLR(optim1, 1/3, 1000)
 
     amp_dtype = torch.float16
+    scaler1 = MyScaler(amp_dtype, dtype)
+    scaler2 = MyScaler(amp_dtype, dtype)
 
-    trainer1 = SyncTrainer(model1, dataloader1, nn.MSELoss(), optim1, sched1, device, amp_dtype, False)
+    profiler1 = MyProfiler(False, ProfilerConfig())
+    profiler2 = MyProfiler(False, ProfilerConfig())
+    profiler3 = MyProfiler(False, ProfilerConfig())
+    profiler4 = MyProfiler(False, ProfilerConfig())
+
+    trainer1 = SyncTrainer(
+        model1, dataloader1, nn.MSELoss(), optim1, sched1, scaler1, profiler1, device)
     trainer1._post_step = _post_step_train
     trainer1._pre_step = lambda a: a  # type: ignore
     res1 = trainer1.run(n_iter=n_sample//bs)
@@ -64,7 +75,8 @@ def test_train():
     dataloader2 = get_dataloader(n_sample, bs, dtype, seed)
     sched2 = torch.optim.lr_scheduler.ConstantLR(optim2, 1/3, 1000)
 
-    trainer2 = AsyncTrainer(model2, dataloader2, nn.MSELoss(), optim2, sched2, device, amp_dtype, False)
+    trainer2 = AsyncTrainer(
+        model2, dataloader2, nn.MSELoss(), optim2, sched2, scaler2, profiler2, device)
     trainer2._post_step = _post_step_train
     trainer2._pre_step = lambda a: a  # type: ignore
     res2 = trainer2.run(n_iter=n_sample//bs)
@@ -83,13 +95,13 @@ def test_train():
     # === compare sync and async inference result ===
 
     dataloader1 = get_dataloader(n_sample, bs, dtype, seed)
-    eval1 = SyncInference(model1, dataloader1, device)
+    eval1 = SyncInference(model1, dataloader1, scaler1, profiler3, device)
     eval1._post_step = _post_step_eval
     eval1._pre_step = lambda a: a  # type: ignore
     res1 = eval1.run(n_iter=n_sample//bs)
 
     dataloader2 = get_dataloader(n_sample, bs, dtype, seed)
-    eval2 = AsyncInference(model2, dataloader2, device)
+    eval2 = AsyncInference(model2, dataloader2, scaler2, profiler4, device)
     eval2._post_step = _post_step_eval
     eval2._pre_step = lambda a: a  # type: ignore
     res2 = eval2.run(n_iter=n_sample//bs)

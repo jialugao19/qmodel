@@ -10,17 +10,21 @@ import time
 from functools import partial
 from pathlib import Path
 
+from typing import Any, Callable, Type, Optional, Sequence
+
 from qmodel.models import *
-from qmodel.trainer import Trainer
-from qmodel.evaluator import Evaluator
-from qmodel.data.dataset import AQ2Dataset
+from qmodel import Trainer, Evaluator
 
 from qmodel.logger import logger
+from qmodel.config import QConfig, ModelConfig, ProfilerConfig, LRSchedulerConfig, EvalConfig
+
+from gru1 import GRU3
+from dataset import AQ2Dataset
 
 @dataclass
-class Config:
+class ModelConfig1(ModelConfig):
 
-    input_dim = 8
+    input_dim: int = 8
     output_dim = 1
     gru_hidden_dim = 192
     gru_num_layers = 4
@@ -30,67 +34,67 @@ class Config:
     dense_dropout = 0.0
     dense_hidden_dim = 512
 
+@dataclass
+class EvalConfig1(EvalConfig):
+    eval_checkpoint_iter: Sequence[int]
+    eval_all_num_iters: int = 0
+    eval_batch_size: int = 16384
+
+@dataclass
+class Config(QConfig):
+
+
+    # data / dataset settings
     window_size = 32
+    ret_col_name: str = "ret_1m_5m"
+    dataset_class: Any = partial(AQ2Dataset, ret_col_name=ret_col_name, window_size=window_size)
 
-    # conv_out_channels = 64
-    # conv_kernel_size = 3
-    # conv_stride = 2
-    # conv_dropout = 0.0
 
-    # model = ConvGRU1
-    model = GRU3
+    # training components
+    model: ModelConfig = ModelConfig1()
+    model_class = GRU3
     seed = 42
+
+    amp_dtype: torch.dtype = torch.float16  # set to float32 to disable amp
+    eval_dtype: torch.dtype = torch.float16
+    train_dtype: torch.dtype = torch.float32
+    criterion: Callable = nn.HuberLoss()
+    optimizer_class: Type[optim.Adam] = optim.Adam
+    learning_rate: float = 5e-4
 
     date = f"{time.strftime('%m%d')}"
     expr_name = f"AQ2_1min_convgru1_clip_{time.strftime('%m%d_%H%M%S')}"
-
     # expr_name = f"AQ2_1min_convgru1_clip_0920_160131"
 
     # date = "best"
     # expr_name = "best2"
 
-    # load_from_iter = 5
     load_from_iter = None
 
     batch_size = 1024
-    eval_batch_size = 16384
-
     num_workers = 32
-
     num_iters = 1 * 10**6 + 1
-
-    device = "cuda"
-    amp_dtype = torch.float16  # or None
-    eval_dtype = torch.float16
-
-    criterion = nn.HuberLoss()
-    optimizer_class = optim.Adam
-
-    learning_rate = 5e-4
-    warmup_iters = 1000
-    finish_decay_iter = 10**6
-    start_warmup_factor = 0.001
-    end_warmup_factor = 1.0
-    eta_min = 1e-6
-
-    root_dir = os.path.join('train_logs', date, expr_name)
-    save_every = 10**4
+    save_every = 10000
     eval_every = 10000
 
-    # num_iters during training / eval only
-    eval_num_iters = 100
-    eval_all_num_iters = 0   # 0 means all
-    # before that, need to run sync trainer to verify result
-
-    profile_section = "none"  # must be in "train" / "eval" / "none"
-    tensorboard_dir = os.path.join('runs', date, expr_name)
-    profile_dir     = os.path.join(tensorboard_dir, "profile")
+    load_from_iter: Optional[int] = None
     log_every = 1000
     mean_loss_length = 2000
 
-    eval_checkpoint_iter = np.arange(0, num_iters - 1, eval_every).tolist()[::-1][:1]
-    ret_col_name = "ret_1m_5m"
-    dataset_class = partial(AQ2Dataset, ret_col_name=ret_col_name, window_size=window_size)
+    root_dir = os.path.join('train_logs', date, expr_name)
+    tensorboard_dir = os.path.join('runs', date, expr_name)
+
+    lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
+    profiler: ProfilerConfig = ProfilerConfig(
+        profile_section="train",  # "train", "eval", "none"
+        profile_dir=os.path.join(tensorboard_dir, "profile")
+    )
+    evaluator: EvalConfig = EvalConfig1(
+        eval_checkpoint_iter=np.arange(0, 1_000_000, 10_000).tolist()[::-1][:1]
+    )
+
+    # todo: complete the eval config, separate default value from qmodel.config
+
 
     def __post_init__(self):
         os.makedirs(self.root_dir, exist_ok=True)
@@ -111,7 +115,7 @@ def copy_config_file(config):
 
 
 def validate_conf(conf: Config):
-    assert conf.profile_section in ["train", "eval", "none"]
+    assert conf.profiler.profile_section in ["train", "eval", "none"]
     assert not hasattr(conf, "do_profile")
     assert conf.eval_every >= conf.num_iters or \
         conf.eval_every % conf.save_every == 0, "must save at each eval"

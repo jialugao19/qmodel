@@ -4,10 +4,12 @@ import torch
 from pathlib import Path
 from typing import Optional
 
-from qmodel.amp_scaler import MyScaler
+from qmodel.components.amp_scaler import MyScaler
+
+from qmodel.config import QConfig
 
 class CheckpointSaver:
-    def __init__(self, root_dir: str, config, device=None):
+    def __init__(self, root_dir: str, config: QConfig, device=None):
         self.dir = Path(root_dir) / "ckpt"
 
         os.makedirs(self.dir, exist_ok=True)
@@ -46,7 +48,9 @@ class CheckpointSaver:
     ) -> int:
         """load the state dict into the provided models"""
 
-        self.ckpt = ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.ckpt = ckpt = torch.load(
+            path, map_location=self.device, weights_only=False
+        )
 
         if model:
             model.load_state_dict(ckpt["model"])

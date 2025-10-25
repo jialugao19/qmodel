@@ -5,8 +5,8 @@ from typing import Callable, Protocol, Iterable
 import time
 from tqdm import tqdm
 
-from qmodel.amp_scaler import MyScaler
-from qmodel.profiler import MyProfiler
+from qmodel.components.amp_scaler import MyScaler
+from qmodel.components.profiler import MyProfiler
 
 class _AsyncBase:
     device: torch.device
@@ -14,12 +14,13 @@ class _AsyncBase:
     model: nn.Module
     dataloader: Iterable | torch.utils.data.DataLoader
     profiler: MyProfiler
+    amp_scaler: MyScaler
     valid: bool
 
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
+        amp_scaler: MyScaler, profiler: MyProfiler,
         device: torch.device, move_target: bool,
-        do_profile: bool, profile_dir: str
     ):
         self.device = torch.device(device)
         self.move_target = move_target
@@ -27,13 +28,14 @@ class _AsyncBase:
         self.model = model
         self.dataloader = dataloader
         self.it = iter(dataloader)
+        self.amp_scaler = amp_scaler
 
         self.ex = ThreadPoolExecutor(max_workers=1)
         self.stream1 = torch.cuda.Stream(device=self.device)   # host->device
         self.stream2 = torch.cuda.Stream(device=self.device)   # device->host
         self.model_stream = torch.cuda.current_stream(device=self.device)
 
-        self.profiler = MyProfiler(do_profile, profile_dir, wait=20, warmup=20, active=12)
+        self.profiler = profiler
         self.valid = True
 
     def _h2d_transfer(self):
@@ -93,6 +95,9 @@ class _AsyncBase:
             # loop idx+1: start data transfer
             f1 = self.ex.submit(self._h2d_transfer)
 
+            # wait idx-1 to prevent to fast CPU submit of tasks
+            event2.synchronize()
+
             # loop idx-1: wait for result transfer
             event2.wait(self.model_stream)
             gbuffer[:bs].copy_(output, non_blocking=True)
@@ -119,19 +124,21 @@ class _SyncBase:
     model: nn.Module
     dataloader: Iterable | torch.utils.data.DataLoader
     profiler: MyProfiler
+    amp_scaler: MyScaler
     valid: bool
 
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
+        amp_scaler: MyScaler, profiler: MyProfiler,
         device: torch.device, move_target: bool,
-        do_profile: bool, profile_dir: str
     ):
         self.device = torch.device(device)
         self.move_target = move_target
         self.model = model
         self.dataloader = dataloader
+        self.amp_scaler = amp_scaler
 
-        self.profiler = MyProfiler(do_profile, profile_dir)
+        self.profiler = profiler
         self.valid = True
 
     def _init(self):
@@ -179,6 +186,7 @@ class _SyncBase:
 class InferenceProto(Protocol):
     model: nn.Module
     device: torch.device
+    amp_scaler: MyScaler
 
 class TrainProto(Protocol):
     model: nn.Module
@@ -186,14 +194,14 @@ class TrainProto(Protocol):
     optimizer: torch.optim.Optimizer
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
     lr_sched: torch.optim.lr_scheduler.LRScheduler
-    scaler: MyScaler
+    amp_scaler: MyScaler
 
 class InferenceMixin:
     def _init(self: InferenceProto):
         self.model.eval()
 
     def _step(self: InferenceProto, data, target, other_meta, curr_it) -> torch.Tensor:
-        with torch.no_grad():
+        with torch.no_grad(), self.amp_scaler.autocast():
             output = self.model(data)
         return output
 
@@ -202,7 +210,6 @@ class InferenceMixin:
 
     def _post_step(self: InferenceProto, res, buffer, target, other_meta, curr_it):
         raise NotImplementedError
-        res.append([buffer, target.ravel(), other_meta])
 
 class TrainMixin:
     def _init(self: TrainProto):
@@ -211,13 +218,13 @@ class TrainMixin:
     def _step(self: TrainProto, data, target, other_meta, curr_it) -> torch.Tensor:
         self.optimizer.zero_grad(set_to_none=True)
 
-        with self.scaler.autocast():
+        with self.amp_scaler.autocast():
             output = self.model(data)
             loss = self.loss_fn(output, target)
 
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        self.amp_scaler.scale(loss).backward()
+        self.amp_scaler.step(self.optimizer)
+        self.amp_scaler.update()
 
         self.lr_sched.step()
 
@@ -231,30 +238,30 @@ class TrainMixin:
 
     def _post_step(self: TrainProto, res: list, buffer: torch.Tensor, target, other_meta, curr_it):
         raise NotImplementedError
-        # print(f"Iter {curr_it}, loss: {buffer}")
-        res.append(buffer)
 
 
 class AsyncInference(InferenceMixin, _AsyncBase):
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
-        device: torch.device,
-        do_profile=False, profile_dir="runs/profiler"
+        amp_scaler: MyScaler, profiler: MyProfiler,
+        device: torch.device
     ):
         super().__init__(
-            model=model, dataloader=dataloader, device=device,
-            move_target=False, do_profile=do_profile, profile_dir=profile_dir
+            model=model, dataloader=dataloader,
+            amp_scaler=amp_scaler, profiler=profiler, device=device,
+            move_target=False
         )
 
 class SyncInference(InferenceMixin, _SyncBase):
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
-        device: torch.device,
-        do_profile=False, profile_dir="runs/profiler"
+        amp_scaler: MyScaler, profiler: MyProfiler,
+        device: torch.device
     ):
         super().__init__(
-            model=model, dataloader=dataloader, device=device,
-            move_target=False, do_profile=do_profile, profile_dir=profile_dir
+            model=model, dataloader=dataloader,
+            amp_scaler=amp_scaler, profiler=profiler, device=device,
+            move_target=False
         )
 
 class AsyncTrainer(TrainMixin, _AsyncBase):
@@ -262,31 +269,33 @@ class AsyncTrainer(TrainMixin, _AsyncBase):
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         loss_fn: Callable, optimizer: torch.optim.Optimizer,
         lr_sched: torch.optim.lr_scheduler.LRScheduler,
-        device: torch.device, amp_dtype: torch.dtype | None, do_profile=False, profile_dir="runs/profiler"
+        amp_scaler: MyScaler, profiler: MyProfiler,
+        device: torch.device
     ):
         super().__init__(
-            model=model, dataloader=dataloader, device=device,
-            move_target=True, do_profile=do_profile, profile_dir=profile_dir
+            model=model, dataloader=dataloader,
+            amp_scaler=amp_scaler, profiler=profiler, device=device,
+            move_target=True
         )
 
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.lr_sched = lr_sched
-        self.scaler = MyScaler(amp_dtype)
 
 class SyncTrainer(TrainMixin, _SyncBase):
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         loss_fn: Callable, optimizer: torch.optim.Optimizer,
         lr_sched: torch.optim.lr_scheduler.LRScheduler,
-        device: torch.device, amp_dtype: torch.dtype | None, do_profile=False, profile_dir="runs/profiler"
+        amp_scaler: MyScaler, profiler: MyProfiler,
+        device: torch.device
     ):
         super().__init__(
-            model=model, dataloader=dataloader, device=device,
-            move_target=True, do_profile=do_profile, profile_dir=profile_dir
+            model=model, dataloader=dataloader,
+            amp_scaler=amp_scaler, profiler=profiler, device=device,
+            move_target=True
         )
 
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.lr_sched = lr_sched
-        self.scaler = MyScaler(amp_dtype)

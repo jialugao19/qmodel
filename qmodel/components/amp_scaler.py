@@ -7,11 +7,17 @@ from typing import Optional
 import contextlib
 
 class MyScaler:
-    def __init__(self, amp_dtype: torch.dtype | None):
-        use_amp = amp_dtype is not None
+    """disable amp by passing amp_dtype=torch.float32"""
+
+    def __init__(self, amp_dtype: torch.dtype, origin_dtype: torch.dtype):
+        assert amp_dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+        use_amp = amp_dtype in [torch.float16, torch.bfloat16] and \
+            origin_dtype in [torch.float32, torch.float64]
+
         self._scaler = GradScaler() if use_amp else None
         self.device_type = "cuda"
-        self.dtype = amp_dtype if isinstance(amp_dtype, torch.dtype) else torch.float32
+        self.dtype = amp_dtype
 
     def autocast(self):
         if self._scaler is not None:

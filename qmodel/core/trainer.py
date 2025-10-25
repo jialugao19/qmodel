@@ -2,66 +2,49 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
-from typing import Tuple
-from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 
-from qmodel.data.sampler import CustomSampler
-from qmodel.data.collate import custom_collate_fn
-from qmodel.evaluator import Evaluator
-from qmodel.lr_scheduler import custom_scheduler
-from qmodel.eval_trainer import AsyncTrainer, SyncTrainer
-from qmodel.checkpoint import CheckpointSaver
+from qmodel.core.eval_trainer import AsyncTrainer, SyncTrainer
+from qmodel.core.evaluator import Evaluator
+from qmodel.components.lr_scheduler import custom_scheduler
+from qmodel.components.checkpoint import CheckpointSaver
+from qmodel.components.amp_scaler import MyScaler
+from qmodel.components.profiler import MyProfiler
+from qmodel.data.dataloader import setup_train_dataloader
+from qmodel.logger import logger
 
-from AQ2.utils.logger import logger
+from qmodel.config import QConfig
 
 from line_profiler import profile
 import time
 
-def setup_dataloader(config, group: str, shuffle: bool = True) -> Tuple[DataLoader, CustomSampler]:
-    dataset   = config.dataset_class(group)
-    seed      = config.seed
-    bs        = config.batch_size
-    n_workers = config.num_workers
-
-    sampler = CustomSampler(dataset, seed=seed, shuffle=shuffle, infinite=True)
-    return DataLoader(
-        dataset,
-        batch_size=bs,
-        sampler=sampler,
-        collate_fn=custom_collate_fn,
-        num_workers=n_workers,
-        pin_memory=True
-    ), sampler
-
 class Trainer(AsyncTrainer):
-    def __init__(self, config) -> None:
+    def __init__(self, config: QConfig) -> None:
         self.config = config
 
         device = config.device
-        model  = config.model(config).to(device)
+        model  = config.model_class(config.model).to(device)
 
         loss_fn   = config.criterion
         lr        = config.learning_rate
         optimizer = config.optimizer_class(model.parameters(), lr=lr)
-        lr_sched  = custom_scheduler(optimizer, config)
-        amp_dtype   = config.amp_dtype
+        lr_sched  = custom_scheduler(optimizer, config.lr_scheduler)
+        amp_scaler  = MyScaler(config.amp_dtype, config.train_dtype)
 
-        do_profile  = config.profile_section == "train"
-        profile_dir = os.path.join(config.profile_dir, "train")
+        do_profile  = config.profiler.profile_section == "train"
+        profiler    = MyProfiler(real_run=do_profile, config=config.profiler)
 
-        dataloader, sampler = setup_dataloader(config, group="train", shuffle=True)
+        dataloader, sampler = setup_train_dataloader(config, group="train", shuffle=True)
 
         super().__init__(
-            model=model, dataloader=dataloader, loss_fn=loss_fn, lr_sched=lr_sched,
-            optimizer=optimizer, device=device, amp_dtype=amp_dtype, do_profile=do_profile, profile_dir=profile_dir
+            model=model, dataloader=dataloader, loss_fn=loss_fn, lr_sched=lr_sched, amp_scaler=amp_scaler, profiler=profiler,
+            optimizer=optimizer, device=device
         )
 
         self.evaluator = Evaluator(config, group="test")
 
         os.makedirs(config.root_dir, exist_ok=True)
-        os.makedirs(config.profile_dir, exist_ok=True)
         os.makedirs(config.tensorboard_dir, exist_ok=True)
 
         self.writer = SummaryWriter(log_dir=config.tensorboard_dir)
@@ -69,16 +52,17 @@ class Trainer(AsyncTrainer):
         self.sampler = sampler
         self.start_iter = 0
 
-        if config.load_from_iter is not None:
-            self.load_from_checkpoint()
+        self.load_from_checkpoint()
 
     def load_from_checkpoint(self):
+        if self.config.load_from_iter is None:
+            return
         iteration: int = self.config.load_from_iter
         path = Path(self.config.root_dir) / f"ckpt/iter_{iteration}.pt"
 
         logger.info(f"load from iteration {iteration}")
         self.checkpointer.load(
-            path, self.model, self.optimizer, self.lr_sched, self.scaler
+            path, self.model, self.optimizer, self.lr_sched, self.amp_scaler
         )
         self.sampler.set_start_iter(iteration * self.config.batch_size)
         self.start_iter = iteration
@@ -93,10 +77,10 @@ class Trainer(AsyncTrainer):
         if curr_it % self.config.save_every == 0:
             self.checkpointer.save(
                 self.model, self.optimizer, self.lr_sched,
-                self.scaler, curr_it
+                self.amp_scaler, curr_it
             )
 
-        if curr_it % self.config.eval_every == 0:
+        if 0 and curr_it % self.config.eval_every == 0:
             torch.cuda.empty_cache()
             metrics = self.evaluator.eval_single(curr_it)
             torch.cuda.empty_cache()

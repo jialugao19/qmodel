@@ -1,9 +1,8 @@
-from dataclasses import dataclass
-from typing import Optional
 import torch.optim as optim
 
+from qmodel.config import LRSchedulerConfig
 
-def custom_scheduler(optimizer: optim.Optimizer, config):
+def custom_scheduler(optimizer: optim.Optimizer, config: LRSchedulerConfig):
     warmup_scheduler = optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=config.start_warmup_factor,
