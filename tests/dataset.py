@@ -37,7 +37,6 @@ class AQ2MinDataset(Dataset):
         self.window_size = window_size
 
         self.d = DataStorage(group)
-        self.flag_col = -1
 
         self.total = self.d.vidx.size
 
@@ -54,7 +53,7 @@ class AQ2MinDataset(Dataset):
         target = raw[:, -1, 11:12]
 
         v1 = torch.from_numpy(data).to(self.dtype)
-        v2 = torch.from_numpy(target).to(self.dtype)
+        v2 = torch.from_numpy(target)
         v3 = torch.from_numpy(raw[:, -1, :3].astype(np.int32))
 
         return v1, v2, v3

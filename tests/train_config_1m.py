@@ -72,15 +72,15 @@ class Config(QConfig):
     load_from_iter = None
 
     batch_size = 1024
-    num_workers = 32
-    num_iters = 1 * 10**6 + 1
-    save_every = 10000
-    eval_every = 10000
+    num_workers = 0
+    num_iters = 60
+    save_every = 12
+    eval_every = 12
     eval_during = True
-    eval_during_num_iters = 200
+    eval_during_num_iters = 20
 
     load_from_iter: Optional[int] = None
-    log_every = 1000
+    log_every = 9
     mean_loss_length = 2000
 
     root_dir = os.path.join('train_logs', date, expr_name)
