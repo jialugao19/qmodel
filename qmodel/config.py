@@ -13,7 +13,7 @@ import torch.optim as optim
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from qmodel.models import QModel
+    # from qmodel.models import QModel
     from qmodel.data.dataset import QDataset
 
 
@@ -57,7 +57,7 @@ class QConfig:
 
     # training components
     model: ModelConfig = field(default_factory=ModelConfig)
-    model_class: Type[QModel] = field(init=False)
+    model_class: Type[nn.Module] = field(init=False)
     seed: int = field(init=False)
 
     amp_dtype: torch.dtype = field(init=False)

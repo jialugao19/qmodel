@@ -28,7 +28,7 @@ def get_dataloader(num_samples, bs, dtype, seed):
     data_tensor, target_tensor = get_data(num_samples, dtype, seed)
     n_batch = num_samples // bs
     return (
-        (data_tensor[i*bs:(i+1)*bs], target_tensor[i*bs:(i+1)*bs], target_tensor[i*bs:(i+1)*bs])
+        (data_tensor[i*bs:(i+1)*bs].pin_memory(), target_tensor[i*bs:(i+1)*bs].pin_memory(), target_tensor[i*bs:(i+1)*bs])
         for i in range(n_batch)
     )
 

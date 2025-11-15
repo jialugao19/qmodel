@@ -1,12 +1,16 @@
 import torch
 import torch.nn as nn
 from concurrent.futures import ThreadPoolExecutor, Future
-from typing import Callable, Protocol, Iterable
+from typing import Callable, Protocol, Iterable, TypeAlias
 import time
 from tqdm import tqdm
 
 from qmodel.components.amp_scaler import MyScaler
 from qmodel.components.profiler import MyProfiler
+
+# alias torch cuda event and _cudaeventbase by the same one
+Event: TypeAlias = torch.cuda.Event | torch._C._CudaEventBase
+Stream: TypeAlias = torch.cuda.Stream | torch._C._CudaStreamBase
 
 class _AsyncBase:
     device: torch.device
@@ -31,29 +35,32 @@ class _AsyncBase:
         self.amp_scaler = amp_scaler
 
         self.ex = ThreadPoolExecutor(max_workers=1)
-        self.stream1 = torch.cuda.Stream(device=self.device)   # host->device
-        self.stream2 = torch.cuda.Stream(device=self.device)   # device->host
-        self.model_stream = torch.cuda.current_stream(device=self.device)
+        self.ex2 = ThreadPoolExecutor(max_workers=1)
+        self.stream1: Stream = torch.cuda.Stream(device=self.device)   # host->device
+        self.stream2: Stream = torch.cuda.Stream(device=self.device)   # device->host
+        self.model_stream: Stream = torch.cuda.Stream(device=self.device)
 
         self.profiler = profiler
         self.valid = True
 
-    def _h2d_transfer(self):
-        try:
-            data, target, other_meta = next(self.it)
-        except StopIteration:
-            return torch.Tensor(), torch.Tensor(), None, True
+    def _h2d_transfer(self, curr_it: int):
+        with torch.profiler.record_function(f"_h2d_transfer_{curr_it}"):
+            try:
+                data, target, other_meta = next(self.it)
+            except StopIteration:
+                return torch.Tensor(), torch.Tensor(), None, None
 
-        with torch.cuda.stream(self.stream1):  # type: ignore
-            data = data.to(self.device, non_blocking=True)
-            if self.move_target:
-                target = target.to(self.device, non_blocking=True)
+            with torch.cuda.stream(self.stream1):  # type: ignore
+                assert data.is_pinned()
+                data = data.to(self.device, non_blocking=True)
+                if self.move_target:
+                    assert target.is_pinned()
+                    target = target.to(self.device, non_blocking=True)
 
-        event = torch.cuda.Event()
-        event.record(self.stream1)
-        event.wait(self.model_stream)
+            event = torch.cuda.Event()
+            event.record(self.stream1)
 
-        return data, target, other_meta, False
+            return data, target, other_meta, event
 
     def _init(self):
         raise NotImplementedError
@@ -67,7 +74,7 @@ class _AsyncBase:
     def _post_step(self, res, buffer, target, other_meta, curr_it):
         raise NotImplementedError
 
-    def run(self, n_iter=99999999, start=0, use_tqdm=True):
+    def run(self, n_iter=99999999, start=0, use_tqdm=True) -> list:
         assert self.valid, "Can only use once, re-init class"
         self.valid = False
         self._init()
@@ -77,7 +84,8 @@ class _AsyncBase:
 
         res, gbuffer = [], None
         event2, event3 = torch.cuda.Event(), torch.cuda.Event()
-        f1 = self.ex.submit(self._h2d_transfer)
+        one_time_events = [torch.cuda.Event() for _ in range(3)]
+        f1 = self.ex.submit(self._h2d_transfer, 0)
 
         if use_tqdm:
             iters = tqdm(range(start, n_iter), initial=start)
@@ -85,26 +93,31 @@ class _AsyncBase:
             iters = range(start, n_iter)
         for curr_it in iters:
             self._pre_step(curr_it)
-            data, target, other_meta, finished = f1.result()
-            if finished:
+            data, target, other_meta, event1 = f1.result()
+            if event1 is None:  # means finished
                 break
 
+            event1.wait(self.model_stream)
+
             # prev round gbuffer must have completed since they are in same stream
-            output = self._step(data, target, other_meta, curr_it)
+            with torch.cuda.stream(self.model_stream):  # type: ignore
+                output = self._step(data, target, other_meta, curr_it)
+
             bs = output.shape[0]
             if gbuffer is None:
                 gbuffer = torch.empty_like(output)
             event3.wait(self.stream1)
 
             # loop idx+1: start data transfer
-            f1 = self.ex.submit(self._h2d_transfer)
+            f1 = self.ex.submit(self._h2d_transfer, curr_it + 1)
 
             # wait idx-1 to prevent to fast CPU submit of tasks
             event2.synchronize()
 
             # loop idx-1: wait for result transfer
             event2.wait(self.model_stream)
-            gbuffer[:bs].copy_(output, non_blocking=True)
+            with torch.cuda.stream(self.model_stream):  # type: ignore
+                gbuffer[:bs].copy_(output, non_blocking=True)
             event3.record(self.model_stream)  # event3: complete copy to gbuffer, can reuse output
 
             event3.wait(self.stream2)
@@ -113,14 +126,32 @@ class _AsyncBase:
                 buffer.copy_(gbuffer[:bs], non_blocking=True)
             event2.record(self.stream2)    # event2: complete copy to host, can reuse gbuffer
 
-            self._post_step(res, buffer, target, other_meta, curr_it)
+            # one-time event used in async post-step
+            event4 = one_time_events[curr_it % len(one_time_events)]
+            # it should have been synced, but for safety we sync again
+            event4.synchronize()
+            event4.record(self.stream2)
+
+            self.ex2.submit(self._post_step_async, res, buffer, target, other_meta, curr_it, event4)
             self.profiler.step()
 
         torch.cuda.synchronize()
         self.profiler.stop()
         self.ex.shutdown(wait=True)
+        self.ex2.shutdown(wait=True)
 
         return res
+
+    def _post_step_async(self, res, buffer, target, other_meta, curr_it, event: Event):
+        """(in sub-thread) ex2 will execute _post_step after event is recorded (i.e., buffer copy done)
+
+        we need this method and the thread because we need to ensure data has arrived at buffer in cpu
+        before we do anything with it
+        """
+
+        event.synchronize()
+        with torch.profiler.record_function(f"_post_step_{curr_it}"):
+            self._post_step(res, buffer, target, other_meta, curr_it)
 
 class _SyncBase:
     device: torch.device
@@ -157,7 +188,7 @@ class _SyncBase:
     def _post_step(self, res, buffer, target, other_meta, curr_it):
         raise NotImplementedError
 
-    def run(self, n_iter=99999999, start=0, use_tqdm=True):
+    def run(self, n_iter=99999999, start=0, use_tqdm=True) -> list:
         assert self.valid, "Can only use once, re-init class"
         self.valid = False
         self._init()

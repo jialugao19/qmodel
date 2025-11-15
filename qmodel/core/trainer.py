@@ -13,6 +13,7 @@ from qmodel.components.amp_scaler import MyScaler
 from qmodel.components.profiler import MyProfiler
 from qmodel.data.dataloader import setup_train_dataloader
 from qmodel.logger import logger
+from qmodel.models import build_model
 
 from qmodel.config import QConfig
 
@@ -24,8 +25,7 @@ class Trainer(AsyncTrainer):
         self.config = config
 
         device = config.device
-        model  = config.model_class(config.model).to(device)
-
+        model     = build_model(config.model_class, config.model).to(device=device)
         loss_fn   = config.criterion
         lr        = config.learning_rate
         optimizer = config.optimizer_class(model.parameters(), lr=lr)
@@ -70,8 +70,9 @@ class Trainer(AsyncTrainer):
     def train(self):
         assert isinstance(self.dataloader, torch.utils.data.DataLoader)
         n_iter = min(len(self.dataloader), self.config.num_iters)
-        self.run(n_iter=n_iter, start=self.start_iter, use_tqdm=False)
+        res = self.run(n_iter=n_iter, start=self.start_iter, use_tqdm=False)
         self.writer.close()
+        return res
 
     def _pre_step(self, curr_it):
         if curr_it % self.config.save_every == 0:

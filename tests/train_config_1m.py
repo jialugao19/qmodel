@@ -55,7 +55,7 @@ class Config(QConfig):
     model_class = GRU3
     seed = 42
 
-    amp_dtype: torch.dtype = torch.float16  # set to float32 to disable amp
+    amp_dtype: torch.dtype = torch.float32  # set to float32 to disable amp
     eval_dtype: torch.dtype = torch.float16
     train_dtype: torch.dtype = torch.float32
     criterion: Callable = nn.HuberLoss()
@@ -72,23 +72,23 @@ class Config(QConfig):
     load_from_iter = None
 
     batch_size = 1024
-    num_workers = 0
-    num_iters = 60
-    save_every = 12
-    eval_every = 12
+    num_workers = 16
+    num_iters = 20
+    save_every = 5000
+    eval_every = 5000
     eval_during = True
-    eval_during_num_iters = 20
+    eval_during_num_iters = 2
 
     load_from_iter: Optional[int] = None
-    log_every = 9
-    mean_loss_length = 2000
+    log_every = 1
+    mean_loss_length = 25
 
     root_dir = os.path.join('train_logs', date, expr_name)
     tensorboard_dir = os.path.join('runs', date, expr_name)
 
     lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
     profiler: ProfilerConfig = ProfilerConfig(
-        profile_section="none",  # "train", "eval", "none"
+        profile_section="train",  # "train", "eval", "none"
         profile_dir=os.path.join(tensorboard_dir, "profile")
     )
     evaluator: EvalConfig = EvalConfig1(
@@ -133,11 +133,15 @@ def main(group: str):
     if group == "train":
         assert conf.date != "best"
         trainer = Trainer(conf)
-        trainer.train()
+        res = trainer.train()
+        print(f"Training finished, result length: {len(res)}")
+        print(res)
     else:
         # eval only
         evaluator = Evaluator(conf, group=group)
         evaluator.evaluate()
+
+    print(list(trainer.model.parameters()))
 
 
 if __name__ == "__main__":

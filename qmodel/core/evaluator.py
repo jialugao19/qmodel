@@ -19,6 +19,7 @@ from qmodel.core.eval_trainer import AsyncInference, SyncInference
 from qmodel.components.profiler import MyProfiler
 from qmodel.components.checkpoint import CheckpointSaver
 from qmodel.components.amp_scaler import MyScaler
+from qmodel.models import build_model
 
 from qmodel.config import QConfig
 
@@ -59,7 +60,7 @@ class Evaluator:
         config      = self.config
         device      = self.config.device
         amp_scaler  = MyScaler(config.amp_dtype, config.eval_dtype)
-        model       = config.model_class(config.model).to(device=device, dtype=config.eval_dtype)
+        model       = build_model(config.model_class, config.model).to(device=device, dtype=config.eval_dtype)
         do_profile  = config.profiler.profile_section == "eval"
         profiler    = MyProfiler(real_run=do_profile, config=config.profiler)
 
