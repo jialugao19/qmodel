@@ -59,7 +59,7 @@ class Evaluator:
     def eval_single(self, it: int, n_iter=0) -> dict:
         config      = self.config
         device      = self.config.device
-        amp_scaler  = MyScaler(config.amp_dtype, config.eval_dtype)
+        amp_scaler  = MyScaler(config.use_amp, config.amp_dtype)
         model       = build_model(config.model_class, config.model).to(device=device, dtype=config.eval_dtype)
         do_profile  = config.profiler.profile_section == "eval"
         profiler    = MyProfiler(real_run=do_profile, config=config.profiler)

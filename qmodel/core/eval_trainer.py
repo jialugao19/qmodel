@@ -172,6 +172,7 @@ class _SyncBase:
         self.model = model
         self.dataloader = dataloader
         self.amp_scaler = amp_scaler
+        self.model_stream: Stream = torch.cuda.Stream(device=self.device)
 
         self.profiler = profiler
         self.valid = True
@@ -211,7 +212,9 @@ class _SyncBase:
             if self.move_target:
                 target = target.to(self.device)
 
-            output = self._step(data, target, other_meta, curr_it)
+            with torch.cuda.stream(self.model_stream):  # type: ignore
+                output = self._step(data, target, other_meta, curr_it)
+            torch.cuda.synchronize()
             buffer = output.cpu()
 
             self._post_step(res, buffer, target, other_meta, curr_it)
@@ -228,6 +231,8 @@ class InferenceProto(Protocol):
     device: torch.device
     amp_scaler: MyScaler
 
+    model_stream: torch.cuda.Stream
+
 class TrainProto(Protocol):
     model: nn.Module
     device: torch.device
@@ -235,6 +240,11 @@ class TrainProto(Protocol):
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
     lr_sched: torch.optim.lr_scheduler.LRScheduler
     amp_scaler: MyScaler
+
+    model_stream: torch.cuda.Stream
+    _g: torch.cuda.CUDAGraph | None
+    _static_inputs: tuple[torch.Tensor, torch.Tensor] | None
+    _static_outputs: torch.Tensor | None
 
 class InferenceMixin:
     def _init(self: InferenceProto):
@@ -254,24 +264,74 @@ class InferenceMixin:
 class TrainMixin:
     def _init(self: TrainProto):
         self.model.train()
+        self._g = None
+        self._static_inputs = None
+        self._static_outputs = None
 
-    def _step(self: TrainProto, data, target, other_meta, curr_it) -> torch.Tensor:
+    def _normal_step(self: TrainProto, data, target, other_meta, curr_it) -> torch.Tensor:
         self.optimizer.zero_grad(set_to_none=True)
 
         with self.amp_scaler.autocast():
             output = self.model(data)
-            loss = self.loss_fn(output, target)
+            loss = self.loss_fn(output, target.to(dtype=output.dtype))
 
         self.amp_scaler.scale(loss).backward()
         self.amp_scaler.step(self.optimizer)
         self.amp_scaler.update()
 
         self.lr_sched.step()
+        # torch.cuda.sychronize()
 
         loss2 = loss.detach()
         if loss2.dim() == 0:
             loss2.unsqueeze_(0)
         return loss2
+
+    def _step(self: TrainProto, data, target, other_meta, curr_it) -> torch.Tensor:
+        if curr_it <= 20:
+            v = self._normal_step(data, target, other_meta, curr_it)
+            return v
+        # todo: add cuda graph call arguments in config
+        if self._g is None:
+            # capture
+            self._g = torch.cuda.CUDAGraph()
+            self._static_inputs = (data.clone(), target.to(dtype=data.dtype).clone())
+            self._static_outputs = torch.empty(1, device=self.device)
+            torch.cuda.synchronize()
+
+            # copy data to static input
+            self.optimizer.zero_grad(set_to_none=True)
+
+            # it looks like everything is not updated but only recorded,
+            # so we have to replay once
+            with torch.cuda.graph(self._g):
+                with self.amp_scaler.autocast():
+                    output = self.model(self._static_inputs[0])
+                    loss = self.loss_fn(output, self._static_inputs[1])
+                    self._static_outputs.copy_(loss)
+
+                self.amp_scaler.scale(self._static_outputs).backward()
+                self.amp_scaler.step(self.optimizer)
+                self.amp_scaler.update()
+                self.lr_sched.step()
+
+            torch.cuda.synchronize()
+
+        else:
+            # replay
+            assert self._static_inputs is not None
+            assert self._static_outputs is not None
+            self._static_inputs[0].copy_(data)
+            self._static_inputs[1].copy_(target.to(dtype=data.dtype))
+            # self._static_inputs[1].copy_(target)
+
+        self._g.replay()
+
+        loss2 = self._static_outputs.detach()
+        if loss2.dim() == 0:
+            loss2.unsqueeze_(0)
+        return loss2
+
 
     def _pre_step(self, curr_it):
         raise NotImplementedError

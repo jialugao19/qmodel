@@ -59,6 +59,7 @@ class GRU3(nn.Module):
     def __init__(self, config):
         super(GRU3, self).__init__()
         self.config = config
+        dtype = config.dtype
 
         self.gru = nn.GRU(
             input_size=config.input_dim,
@@ -66,7 +67,8 @@ class GRU3(nn.Module):
             num_layers=config.gru_num_layers,
             bidirectional=config.gru_bidirectional,
             dropout=config.gru_dropout if config.gru_num_layers > 1 else 0,
-            batch_first=True
+            batch_first=True,
+            dtype=dtype
         )
 
         gru_output_dim = config.gru_hidden_dim
@@ -81,7 +83,7 @@ class GRU3(nn.Module):
             nn.ReLU(),
             nn.Dropout(config.dense_dropout),
             nn.Linear(config.dense_hidden_dim, config.output_dim)
-        )
+        ).to(dtype=dtype)
 
     def forward(self, x):
         gru_out, _ = self.gru(x)

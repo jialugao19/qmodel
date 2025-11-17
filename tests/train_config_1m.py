@@ -23,6 +23,7 @@ from dataset import AQ2Dataset
 
 @dataclass
 class ModelConfig1(ModelConfig):
+    dtype: torch.dtype = torch.float16
 
     input_dim: int = 8
     output_dim = 1
@@ -59,8 +60,10 @@ class Config(QConfig):
     eval_dtype: torch.dtype = torch.float16
     train_dtype: torch.dtype = torch.float32
     criterion: Callable = nn.HuberLoss()
-    optimizer_class: Type[optim.Adam] = optim.Adam
+    optimizer_class: Type[optim.Adam] = partial(optim.Adam, capturable=True)
     learning_rate: float = 5e-4
+    use_amp: str = "custom"  # "torch", "custom", "none"
+    use_lr_sched: str = "custom"  # "torch", "custom"
 
     date = f"{time.strftime('%m%d')}"
     expr_name = f"AQ2_1min_convgru1_clip_{time.strftime('%m%d_%H%M%S')}"
@@ -72,8 +75,8 @@ class Config(QConfig):
     load_from_iter = None
 
     batch_size = 1024
-    num_workers = 16
-    num_iters = 20
+    num_workers = 0
+    num_iters = 30
     save_every = 5000
     eval_every = 5000
     eval_during = True
@@ -81,14 +84,14 @@ class Config(QConfig):
 
     load_from_iter: Optional[int] = None
     log_every = 1
-    mean_loss_length = 25
+    mean_loss_length = 35
 
     root_dir = os.path.join('train_logs', date, expr_name)
     tensorboard_dir = os.path.join('runs', date, expr_name)
 
     lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
     profiler: ProfilerConfig = ProfilerConfig(
-        profile_section="train",  # "train", "eval", "none"
+        profile_section="none",  # "train", "eval", "none"
         profile_dir=os.path.join(tensorboard_dir, "profile")
     )
     evaluator: EvalConfig = EvalConfig1(
@@ -101,8 +104,8 @@ class Config(QConfig):
         log_file = f"{self.root_dir}/logs.log"
         logger.add_file_log(log_file)
 
-        for k, v in asdict(self).items():
-            logger.info(f"{k}: {v}")
+        # for k, v in asdict(self).items():
+        #     logger.info(f"{k}: {v}")
 
 
 def copy_config_file(config):
@@ -136,12 +139,12 @@ def main(group: str):
         res = trainer.train()
         print(f"Training finished, result length: {len(res)}")
         print(res)
+        # print(list(trainer.model.parameters()))
     else:
         # eval only
         evaluator = Evaluator(conf, group=group)
         evaluator.evaluate()
 
-    print(list(trainer.model.parameters()))
 
 
 if __name__ == "__main__":

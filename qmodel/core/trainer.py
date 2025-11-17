@@ -20,17 +20,18 @@ from qmodel.config import QConfig
 from line_profiler import profile
 import time
 
-class Trainer(AsyncTrainer):
+class Trainer(SyncTrainer):
     def __init__(self, config: QConfig) -> None:
         self.config = config
 
         device = config.device
-        model     = build_model(config.model_class, config.model).to(device=device)
+        dtype  = config.train_dtype
+        model     = build_model(config.model_class, config.model).to(device=device, dtype=dtype)
         loss_fn   = config.criterion
         lr        = config.learning_rate
         optimizer = config.optimizer_class(model.parameters(), lr=lr)
-        lr_sched  = custom_scheduler(optimizer, config.lr_scheduler)
-        amp_scaler  = MyScaler(config.amp_dtype, config.train_dtype)
+        lr_sched  = custom_scheduler(optimizer, config)
+        amp_scaler  = MyScaler(config.use_amp, config.amp_dtype)
 
         do_profile  = config.profiler.profile_section == "train"
         profiler    = MyProfiler(real_run=do_profile, config=config.profiler)

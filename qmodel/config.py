@@ -36,7 +36,7 @@ class LRSchedulerConfig:
 
 @dataclass
 class ModelConfig:
-    pass
+    dtype: torch.dtype = torch.float32
 
 @dataclass
 class EvalConfig:
@@ -66,6 +66,8 @@ class QConfig:
     criterion: Callable = field(init=False)
     optimizer_class: Type[optim.Adam] = field(init=False)
     learning_rate: float = field(init=False)
+    use_amp: str = field(init=False)
+    use_lr_sched: str = field(init=False)
 
     # run metadata
     date: str = field(default_factory=lambda: time.strftime("%m%d"))

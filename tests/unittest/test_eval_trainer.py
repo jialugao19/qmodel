@@ -8,6 +8,7 @@ from qmodel.core.eval_trainer import AsyncInference, AsyncTrainer, SyncInference
 from qmodel.components.amp_scaler import MyScaler
 from qmodel.components.profiler import MyProfiler
 from qmodel.config import ProfilerConfig
+from qmodel.components.lr_scheduler import custom_scheduler, GraphLRScheduler
 
 class Result(nn.Module):
     def forward(self, x):
@@ -39,23 +40,66 @@ def _post_step_train(res: list, buffer: torch.Tensor, target, other_meta, curr_i
     # print(f"Iter {curr_it}, loss: {buffer}")
     res.append(buffer)
 
+
+def get_scheduler(sched_type: str, optimizer, lr):
+    if sched_type == "custom":
+        return GraphLRScheduler(
+                optimizer=optimizer,
+                warmup_iters=19,
+                total_iters=160,
+                start_factor=0.01,
+                end_factor=0.95,
+                eta_min=1e-4,
+                base_lr=lr,
+                device="cuda",
+            )
+    assert sched_type == "torch"
+
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.01,
+        end_factor=0.95,
+        total_iters=19
+    )
+    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=160 - 19,
+        eta_min=1e-4
+    )
+
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, main_scheduler],
+        milestones=[19]
+    )
+    # restore lr
+    for group in optimizer.param_groups:
+        group['lr'] = torch.tensor(lr * 0.01, device="cuda", dtype=torch.float64, requires_grad=False)
+    return scheduler
+
+
 def test_train():
     device = torch.device("cuda")
     n_sample = 5120
     bs = 32
     seed = 42
     dtype = torch.float32
+    lr = 1e-2
 
-    # model1
     model1 = get_model(dtype)
-    optim1 = torch.optim.SGD(model1.parameters(), 1e-2)
+    model2 = get_model(dtype)
+    optim1 = torch.optim.SGD(model1.parameters(), lr)
+    optim2 = torch.optim.SGD(model2.parameters(), lr)
 
     dataloader1 = get_dataloader(n_sample, bs, dtype, seed)
-    sched1 = torch.optim.lr_scheduler.ConstantLR(optim1, 1/3, 1000)
+    sched1 = get_scheduler("custom", optim1, lr)
+    sched2 = get_scheduler("torch", optim2, lr)
 
     amp_dtype = torch.float16
-    scaler1 = MyScaler(amp_dtype, dtype)
-    scaler2 = MyScaler(amp_dtype, dtype)
+    use_amp = "custom"
+    scaler1 = MyScaler(use_amp, amp_dtype)
+    use_amp = "custom"
+    scaler2 = MyScaler(use_amp, amp_dtype)
 
     profiler1 = MyProfiler(False, ProfilerConfig("none", ""))
     profiler2 = MyProfiler(False, ProfilerConfig("none", ""))
@@ -69,11 +113,8 @@ def test_train():
     res1 = trainer1.run(n_iter=n_sample//bs)
 
     # model2
-    model2 = get_model(dtype)
-    optim2 = torch.optim.SGD(model2.parameters(), 1e-2)
 
     dataloader2 = get_dataloader(n_sample, bs, dtype, seed)
-    sched2 = torch.optim.lr_scheduler.ConstantLR(optim2, 1/3, 1000)
 
     trainer2 = AsyncTrainer(
         model2, dataloader2, nn.MSELoss(), optim2, sched2, scaler2, profiler2, device)
@@ -83,6 +124,7 @@ def test_train():
 
     r1 = torch.utils.data.default_collate(res1)
     r2 = torch.utils.data.default_collate(res2)
+    print(f"Mean l2 error: {(((r1 - r2)**2).sum() / (r1**2).sum()).item() ** 0.5:.3e}")
     assert torch.allclose(r1, r2, rtol=0, atol=0)
 
     assert all([
@@ -108,6 +150,7 @@ def test_train():
 
     r1 = torch.utils.data.default_collate(res1)[0]
     r2 = torch.utils.data.default_collate(res2)[0]
+    print(f"Mean l2 error: {(((r1 - r2)**2).sum() / (r1**2).sum()).item() ** 0.5:.3e}")
     assert torch.allclose(r1, r2, rtol=0, atol=0)
 
     print("Eval verification success")
