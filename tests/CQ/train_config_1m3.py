@@ -20,6 +20,7 @@ from qmodel.config import QConfig, ModelConfig, ProfilerConfig, LRSchedulerConfi
 
 from gru1 import GRU3
 from dataset import CQ2Dataset
+CONF_FILES = ["gru1.py", "dataset.py", "train_config_1m3.py"]
 
 @dataclass
 class ModelConfig1(ModelConfig):
@@ -115,10 +116,12 @@ class Config(QConfig):
 
 def copy_config_file(config):
     os.makedirs(config.root_dir, exist_ok=True)
-    config_file_path = __file__
-    dest_path = os.path.join(config.root_dir, os.path.basename(config_file_path))
-    shutil.copy2(config_file_path, dest_path)
-    logger.info(f"Config file copied to: {dest_path}")
+
+    for file in CONF_FILES:
+        config_file_path = Path(__file__).parent / file
+        dest_path = os.path.join(config.root_dir, os.path.basename(config_file_path))
+        shutil.copy2(config_file_path, dest_path)
+        logger.info(f"Config file copied to: {dest_path}")
 
 
 def validate_conf(conf: Config):
