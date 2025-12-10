@@ -72,9 +72,11 @@ class Evaluator:
         logger.info(f"Evaluating checkpoint: {ckpt}, iter {it}")
         self.checkpointer.load(ckpt, model, None, None, None)
 
+        num_normal_steps = config.num_normal_steps if config.evaluator.eval_use_cuda_graph else 9999999999
+
         inferencer = Inferencer(
             model=model, dataloader=dataloader, device=device,
-            amp_scaler=amp_scaler, profiler=profiler
+            amp_scaler=amp_scaler, profiler=profiler, num_normal_steps=num_normal_steps
         )
         if n_iter == 0:
             n_iter = len(dataloader)

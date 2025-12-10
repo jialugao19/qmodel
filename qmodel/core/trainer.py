@@ -20,7 +20,7 @@ from qmodel.config import QConfig
 from line_profiler import profile
 import time
 
-class Trainer(SyncTrainer):
+class Trainer(AsyncTrainer):
     def __init__(self, config: QConfig) -> None:
         self.config = config
 
@@ -38,9 +38,11 @@ class Trainer(SyncTrainer):
 
         dataloader, sampler = setup_train_dataloader(config, group="train", shuffle=True)
 
+        num_normal_steps = config.num_normal_steps if config.train_use_cuda_graph else 9999999999
+
         super().__init__(
             model=model, dataloader=dataloader, loss_fn=loss_fn, lr_sched=lr_sched, amp_scaler=amp_scaler, profiler=profiler,
-            optimizer=optimizer, device=device
+            optimizer=optimizer, device=device, num_normal_steps=num_normal_steps
         )
 
         self.evaluator = Evaluator(config, group="test")

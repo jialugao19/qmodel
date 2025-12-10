@@ -3,6 +3,7 @@ import time
 import os
 
 from qmodel.config import ProfilerConfig
+from qmodel.logger import logger
 
 class MyProfiler:
     profiler: None | torch.profiler.profiler.profile
@@ -48,3 +49,6 @@ class MyProfiler:
         if self.profiler is not None and not self.finished:
             self.profiler.stop()
             self.finished = True
+            logger.info("Profiler stopped and data saved.")
+            # flops
+            

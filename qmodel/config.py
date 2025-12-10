@@ -43,6 +43,7 @@ class EvalConfig:
     eval_checkpoint_iter: Sequence[int] = field(init=False)
     eval_all_num_iters: int = field(init=False)
     eval_batch_size: int = field(init=False)
+    eval_use_cuda_graph: bool = field(init=False)
 
 
 # type hint is mandatory to allow dataclass to recognize fields correctly
@@ -64,10 +65,14 @@ class QConfig:
     eval_dtype: torch.dtype = field(init=False)
     train_dtype: torch.dtype = field(init=False)
     criterion: Callable = field(init=False)
-    optimizer_class: Type[optim.Adam] = field(init=False)
+    optimizer_class: Callable[..., optim.Optimizer] = field(init=False)
     learning_rate: float = field(init=False)
     use_amp: str = field(init=False)
     use_lr_sched: str = field(init=False)
+
+    # cuda graph
+    num_normal_steps: int = 20
+    train_use_cuda_graph: bool = field(init=False)
 
     # run metadata
     date: str = field(default_factory=lambda: time.strftime("%m%d"))

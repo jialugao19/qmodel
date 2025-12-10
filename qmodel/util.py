@@ -5,11 +5,20 @@ import polars as pl
 def merge_date_time_dataframe(df: pd.DataFrame, date_col="date", time_col="time") -> pd.Series:
 
     tmp_df = pl.from_pandas(df[[date_col, time_col]])
-    tmp_df = tmp_df.lazy().select(
-        pl.col(date_col).add(2*10**7).cast(pl.Int64).mul(10**6)
-        .add(pl.col(time_col).cast(pl.Int64))
-        .cast(pl.Utf8)
-        .str.strptime(pl.Datetime("ms"), "%Y%m%d%H%M%S")
-        .alias("DateTime")
-    ).collect()
+
+    if df[date_col].max() > 100000:
+        tmp_df = tmp_df.lazy().select(
+            pl.col(date_col).add(2*10**7).cast(pl.Int64).mul(10**6)
+            .add(pl.col(time_col).cast(pl.Int64))
+            .cast(pl.Utf8)
+            .str.strptime(pl.Datetime("ms"), "%Y%m%d%H%M%S")
+            .alias("DateTime")
+        ).collect()
+
+    else:
+        tmp_df = tmp_df.select(
+            pl.col(date_col).cast(pl.Date).cast(pl.Datetime).add(
+                pl.col(time_col).cast(pl.Int64).mul(1000).cast(pl.Duration("ms"))
+            ).alias("DateTime")
+        )
     return tmp_df.to_pandas().DateTime

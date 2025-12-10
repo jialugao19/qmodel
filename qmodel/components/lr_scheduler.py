@@ -1,7 +1,11 @@
 import torch.optim as optim
 import torch
 import math
+from typing import TypeAlias, Callable
 from qmodel.config import QConfig
+
+Scheduler: TypeAlias = "optim.lr_scheduler.LRScheduler | GraphLRScheduler"
+
 
 def custom_scheduler(optimizer: optim.Optimizer, config: QConfig):
     lrconf = config.lr_scheduler

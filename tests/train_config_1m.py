@@ -40,6 +40,7 @@ class EvalConfig1(EvalConfig):
     eval_checkpoint_iter: Sequence[int]
     eval_all_num_iters: int = 0
     eval_batch_size: int = 16384
+    eval_use_cuda_graph: bool = True
 
 @dataclass
 class Config(QConfig):
@@ -60,10 +61,14 @@ class Config(QConfig):
     eval_dtype: torch.dtype = torch.float16
     train_dtype: torch.dtype = torch.float32
     criterion: Callable = nn.HuberLoss()
-    optimizer_class: Type[optim.Adam] = partial(optim.Adam, capturable=True)
+    optimizer_class: Callable[..., optim.Optimizer] = partial(optim.Adam, capturable=True)
     learning_rate: float = 5e-4
     use_amp: str = "custom"  # "torch", "custom", "none"
     use_lr_sched: str = "custom"  # "torch", "custom"
+
+    # cuda graph
+    train_use_cuda_graph: bool = True
+    num_normal_steps: int = 20
 
     date = f"{time.strftime('%m%d')}"
     expr_name = f"AQ2_1min_convgru1_clip_{time.strftime('%m%d_%H%M%S')}"
@@ -75,7 +80,7 @@ class Config(QConfig):
     load_from_iter = None
 
     batch_size = 1024
-    num_workers = 0
+    num_workers = 16
     num_iters = 30
     save_every = 5000
     eval_every = 5000
@@ -83,7 +88,7 @@ class Config(QConfig):
     eval_during_num_iters = 2
 
     load_from_iter: Optional[int] = None
-    log_every = 1
+    log_every = 5
     mean_loss_length = 35
 
     root_dir = os.path.join('train_logs', date, expr_name)
@@ -91,7 +96,7 @@ class Config(QConfig):
 
     lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
     profiler: ProfilerConfig = ProfilerConfig(
-        profile_section="none",  # "train", "eval", "none"
+        profile_section="train",  # "train", "eval", "none"
         profile_dir=os.path.join(tensorboard_dir, "profile")
     )
     evaluator: EvalConfig = EvalConfig1(

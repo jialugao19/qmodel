@@ -79,6 +79,10 @@ def get_scheduler(sched_type: str, optimizer, lr):
 
 
 def test_train():
+
+    check_train()
+
+def check_train():
     device = torch.device("cuda")
     n_sample = 5120
     bs = 32
@@ -88,8 +92,8 @@ def test_train():
 
     model1 = get_model(dtype)
     model2 = get_model(dtype)
-    optim1 = torch.optim.SGD(model1.parameters(), lr)
-    optim2 = torch.optim.SGD(model2.parameters(), lr)
+    optim1 = torch.optim.Adam(model1.parameters(), lr)
+    optim2 = torch.optim.Adam(model2.parameters(), lr)
 
     dataloader1 = get_dataloader(n_sample, bs, dtype, seed)
     sched1 = get_scheduler("custom", optim1, lr)
@@ -106,8 +110,11 @@ def test_train():
     profiler3 = MyProfiler(False, ProfilerConfig("none", ""))
     profiler4 = MyProfiler(False, ProfilerConfig("none", ""))
 
+    num_normal_steps1 = 20
+    num_normal_steps2 = 2000
+
     trainer1 = SyncTrainer(
-        model1, dataloader1, nn.MSELoss(), optim1, sched1, scaler1, profiler1, device)
+        model1, dataloader1, nn.MSELoss(), optim1, sched1, scaler1, profiler1, device, num_normal_steps1)
     trainer1._post_step = _post_step_train
     trainer1._pre_step = lambda a: a  # type: ignore
     res1 = trainer1.run(n_iter=n_sample//bs)
@@ -117,7 +124,7 @@ def test_train():
     dataloader2 = get_dataloader(n_sample, bs, dtype, seed)
 
     trainer2 = AsyncTrainer(
-        model2, dataloader2, nn.MSELoss(), optim2, sched2, scaler2, profiler2, device)
+        model2, dataloader2, nn.MSELoss(), optim2, sched2, scaler2, profiler2, device, num_normal_steps2)
     trainer2._post_step = _post_step_train
     trainer2._pre_step = lambda a: a  # type: ignore
     res2 = trainer2.run(n_iter=n_sample//bs)
@@ -137,13 +144,13 @@ def test_train():
     # === compare sync and async inference result ===
 
     dataloader1 = get_dataloader(n_sample, bs, dtype, seed)
-    eval1 = SyncInference(model1, dataloader1, scaler1, profiler3, device)
+    eval1 = SyncInference(model1, dataloader1, scaler1, profiler3, device, num_normal_steps1)
     eval1._post_step = _post_step_eval
     eval1._pre_step = lambda a: a  # type: ignore
     res1 = eval1.run(n_iter=n_sample//bs)
 
     dataloader2 = get_dataloader(n_sample, bs, dtype, seed)
-    eval2 = AsyncInference(model2, dataloader2, scaler2, profiler4, device)
+    eval2 = AsyncInference(model2, dataloader2, scaler2, profiler4, device, num_normal_steps2)
     eval2._post_step = _post_step_eval
     eval2._pre_step = lambda a: a  # type: ignore
     res2 = eval2.run(n_iter=n_sample//bs)

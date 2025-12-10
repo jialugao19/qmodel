@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from qmodel.components.amp_scaler import MyScaler
 from qmodel.components.profiler import MyProfiler
+from qmodel.components.lr_scheduler import Scheduler
 
 # alias torch cuda event and _cudaeventbase by the same one
 Event: TypeAlias = torch.cuda.Event | torch._C._CudaEventBase
@@ -25,6 +26,7 @@ class _AsyncBase:
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         amp_scaler: MyScaler, profiler: MyProfiler,
         device: torch.device, move_target: bool,
+        num_normal_steps: int
     ):
         self.device = torch.device(device)
         self.move_target = move_target
@@ -42,6 +44,9 @@ class _AsyncBase:
 
         self.profiler = profiler
         self.valid = True
+
+        assert num_normal_steps >= 12
+        self.num_normal_steps = num_normal_steps
 
     def _h2d_transfer(self, curr_it: int):
         with torch.profiler.record_function(f"_h2d_transfer_{curr_it}"):
@@ -65,8 +70,11 @@ class _AsyncBase:
     def _init(self):
         raise NotImplementedError
 
-    def _step(self, data, target, other_meta, curr_it) -> torch.Tensor:
+    def _normal_step(self, data, target, other_meta, curr_it) -> torch.Tensor:
         raise NotImplementedError
+
+    def _step(self, data, target, other_meta, curr_it) -> torch.Tensor:
+        return self._normal_step(data, target, other_meta, curr_it)
 
     def _pre_step(self, curr_it):
         raise NotImplementedError
@@ -166,6 +174,7 @@ class _SyncBase:
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         amp_scaler: MyScaler, profiler: MyProfiler,
         device: torch.device, move_target: bool,
+        num_normal_steps: int
     ):
         self.device = torch.device(device)
         self.move_target = move_target
@@ -177,11 +186,17 @@ class _SyncBase:
         self.profiler = profiler
         self.valid = True
 
+        assert num_normal_steps >= 12
+        self.num_normal_steps = num_normal_steps
+
     def _init(self):
         raise NotImplementedError
 
-    def _step(self, data, target, other_meta, curr_it):
+    def _normal_step(self, data, target, other_meta, curr_it) -> torch.Tensor:
         raise NotImplementedError
+
+    def _step(self, data, target, other_meta, curr_it) -> torch.Tensor:
+        return self._normal_step(data, target, other_meta, curr_it)
 
     def _pre_step(self, curr_it):
         raise NotImplementedError
@@ -231,29 +246,82 @@ class InferenceProto(Protocol):
     device: torch.device
     amp_scaler: MyScaler
 
-    model_stream: torch.cuda.Stream
-
-class TrainProto(Protocol):
-    model: nn.Module
-    device: torch.device
-    optimizer: torch.optim.Optimizer
-    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-    lr_sched: torch.optim.lr_scheduler.LRScheduler
-    amp_scaler: MyScaler
+    num_normal_steps: int
 
     model_stream: torch.cuda.Stream
     _g: torch.cuda.CUDAGraph | None
     _static_inputs: tuple[torch.Tensor, torch.Tensor] | None
     _static_outputs: torch.Tensor | None
 
+    def _normal_step(self, data, target, other_meta, curr_it) -> torch.Tensor:
+        ...
+
+class TrainProto(Protocol):
+    model: nn.Module
+    device: torch.device
+    optimizer: torch.optim.Optimizer
+    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    lr_sched: Scheduler
+    amp_scaler: MyScaler
+
+    num_normal_steps: int
+
+    model_stream: torch.cuda.Stream
+    _g: torch.cuda.CUDAGraph | None
+    _static_inputs: tuple[torch.Tensor, torch.Tensor] | None
+    _static_outputs: torch.Tensor | None
+
+    def _normal_step(self, data, target, other_meta, curr_it) -> torch.Tensor:
+        ...
+
+# fix last batch size not match cuda graph problem
 class InferenceMixin:
     def _init(self: InferenceProto):
         self.model.eval()
+        self._g = None
+        self._static_inputs = None
+        self._static_outputs = None
 
-    def _step(self: InferenceProto, data, target, other_meta, curr_it) -> torch.Tensor:
+    def _normal_step(self: InferenceProto, data, target, other_meta, curr_it) -> torch.Tensor:
         with torch.no_grad(), self.amp_scaler.autocast():
             output = self.model(data)
         return output
+
+    def _step(self: InferenceProto, data: torch.Tensor, target: torch.Tensor, other_meta, curr_it: int) -> torch.Tensor:
+        if curr_it <= self.num_normal_steps:
+            v = self._normal_step(data, target, other_meta, curr_it)
+            return v
+        if self._g is None:
+            # capture
+            self._g = torch.cuda.CUDAGraph()
+            self._static_inputs = (data.clone(), torch.tensor(0, device=self.device))
+            self._static_outputs = torch.zeros_like(target, device=self.device)
+            torch.cuda.synchronize()
+
+            # it looks like everything is not updated but only recorded,
+            # so we have to replay once
+            with torch.cuda.graph(self._g):
+                with torch.no_grad(), self.amp_scaler.autocast():
+                    output = self.model(self._static_inputs[0])
+                    self._static_outputs.copy_(output)
+
+            torch.cuda.synchronize()
+        else:
+            # replay
+            assert self._static_inputs is not None
+            assert self._static_outputs is not None
+
+            if self._static_inputs[0].shape[0] != data.shape[0]:
+                # maybe last small batch, fall back to normal step
+                return self._normal_step(data, target, other_meta, curr_it)
+
+            self._static_inputs[0].copy_(data)
+
+        self._g.replay()
+
+        # it is not copied but only detached!
+        result = self._static_outputs.detach()
+        return result
 
     def _pre_step(self, curr_it):
         raise NotImplementedError
@@ -280,18 +348,17 @@ class TrainMixin:
         self.amp_scaler.update()
 
         self.lr_sched.step()
-        # torch.cuda.sychronize()
 
         loss2 = loss.detach()
         if loss2.dim() == 0:
             loss2.unsqueeze_(0)
         return loss2
 
-    def _step(self: TrainProto, data, target, other_meta, curr_it) -> torch.Tensor:
-        if curr_it <= 20:
+    def _step(self: TrainProto, data: torch.Tensor, target: torch.Tensor, other_meta, curr_it: int) -> torch.Tensor:
+        if curr_it <= self.num_normal_steps:
             v = self._normal_step(data, target, other_meta, curr_it)
             return v
-        # todo: add cuda graph call arguments in config
+
         if self._g is None:
             # capture
             self._g = torch.cuda.CUDAGraph()
@@ -321,6 +388,11 @@ class TrainMixin:
             # replay
             assert self._static_inputs is not None
             assert self._static_outputs is not None
+
+            if self._static_inputs[0].shape[0] != data.shape[0]:
+                # maybe last small batch, fall back to normal step
+                return self._normal_step(data, target, other_meta, curr_it)
+
             self._static_inputs[0].copy_(data)
             self._static_inputs[1].copy_(target.to(dtype=data.dtype))
             # self._static_inputs[1].copy_(target)
@@ -344,38 +416,38 @@ class AsyncInference(InferenceMixin, _AsyncBase):
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         amp_scaler: MyScaler, profiler: MyProfiler,
-        device: torch.device
+        device: torch.device, num_normal_steps: int
     ):
         super().__init__(
             model=model, dataloader=dataloader,
             amp_scaler=amp_scaler, profiler=profiler, device=device,
-            move_target=False
+            move_target=False, num_normal_steps=num_normal_steps
         )
 
 class SyncInference(InferenceMixin, _SyncBase):
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         amp_scaler: MyScaler, profiler: MyProfiler,
-        device: torch.device
+        device: torch.device, num_normal_steps: int
     ):
         super().__init__(
             model=model, dataloader=dataloader,
             amp_scaler=amp_scaler, profiler=profiler, device=device,
-            move_target=False
+            move_target=False, num_normal_steps=num_normal_steps
         )
 
 class AsyncTrainer(TrainMixin, _AsyncBase):
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         loss_fn: Callable, optimizer: torch.optim.Optimizer,
-        lr_sched: torch.optim.lr_scheduler.LRScheduler,
+        lr_sched: Scheduler,
         amp_scaler: MyScaler, profiler: MyProfiler,
-        device: torch.device
+        device: torch.device, num_normal_steps: int
     ):
         super().__init__(
             model=model, dataloader=dataloader,
             amp_scaler=amp_scaler, profiler=profiler, device=device,
-            move_target=True
+            move_target=True, num_normal_steps=num_normal_steps
         )
 
         self.optimizer = optimizer
@@ -386,14 +458,14 @@ class SyncTrainer(TrainMixin, _SyncBase):
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         loss_fn: Callable, optimizer: torch.optim.Optimizer,
-        lr_sched: torch.optim.lr_scheduler.LRScheduler,
+        lr_sched: Scheduler,
         amp_scaler: MyScaler, profiler: MyProfiler,
-        device: torch.device
+        device: torch.device, num_normal_steps: int
     ):
         super().__init__(
             model=model, dataloader=dataloader,
             amp_scaler=amp_scaler, profiler=profiler, device=device,
-            move_target=True
+            move_target=True, num_normal_steps=num_normal_steps
         )
 
         self.optimizer = optimizer

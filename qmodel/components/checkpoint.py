@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from qmodel.components.amp_scaler import MyScaler
-
+from qmodel.components.lr_scheduler import Scheduler
 from qmodel.config import QConfig
 
 class CheckpointSaver:
@@ -23,7 +23,7 @@ class CheckpointSaver:
         self,
         model: torch.nn.Module,
         optim: torch.optim.Optimizer,
-        sched: torch.optim.lr_scheduler.LRScheduler,
+        sched: Scheduler,
         scaler: MyScaler, it: int
     ) -> str:
         self.ckpt = {
@@ -43,7 +43,7 @@ class CheckpointSaver:
         self, path: Path | str,
         model: Optional[torch.nn.Module],
         optim: Optional[torch.optim.Optimizer],
-        sched: Optional[torch.optim.lr_scheduler.LRScheduler],
+        sched: Optional[Scheduler],
         scaler: Optional[MyScaler]
     ) -> int:
         """load the state dict into the provided models"""
