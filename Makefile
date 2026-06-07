@@ -1,5 +1,5 @@
 
-.PHONY: clean build install editable-install
+.PHONY: clean build install editable-install release-wheel
 
 
 clean:
@@ -16,3 +16,7 @@ install: clean
 
 editable-install: clean
 	pip install -e .
+
+release-wheel: clean
+	python -m build --wheel
+	python -m twine upload dist/*.whl

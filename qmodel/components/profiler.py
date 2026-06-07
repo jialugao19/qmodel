@@ -1,9 +1,50 @@
 import torch
 import time
 import os
+from contextlib import contextmanager
+from typing import Callable, TypeAlias
 
 from qmodel.config import ProfilerConfig
 from qmodel.logger import logger
+
+Stream: TypeAlias = torch.cuda.Stream | torch._C._CudaStreamBase
+AsyncProfilingMarker: TypeAlias = Callable[[str, Stream | None], None]
+
+class AsyncProfilingHelper:
+    enabled: bool = False
+    marker: AsyncProfilingMarker | None = None
+
+    @classmethod
+    def enable(cls, marker: AsyncProfilingMarker):
+        """Enable async profiling regions globally."""
+        # Store the global marker and enable region recording.
+        cls.marker = marker
+        cls.enabled = True
+
+    @classmethod
+    def disable(cls):
+        """Disable async profiling regions globally."""
+        # Clear global profiling state after a diagnostic run.
+        cls.enabled = False
+        cls.marker = None
+
+    @contextmanager
+    def region(self, region_name: str, curr_it: int, stream: Stream | None):
+        """Return a context manager for one async profiling region."""
+        # Yield directly when async profiling is disabled.
+        if not AsyncProfilingHelper.enabled:
+            yield
+            return
+
+        # Emit start/end markers around the wrapped region.
+        marker = AsyncProfilingHelper.marker
+        assert marker is not None
+        marker(f"{region_name}_start_{curr_it}", stream)
+        try:
+            yield
+        finally:
+            marker(f"{region_name}_end_{curr_it}", stream)
+
 
 class MyProfiler:
     profiler: None | torch.profiler.profiler.profile
@@ -51,4 +92,3 @@ class MyProfiler:
             self.finished = True
             logger.info("Profiler stopped and data saved.")
             # flops
-            

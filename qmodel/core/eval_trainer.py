@@ -6,12 +6,13 @@ import time
 from tqdm import tqdm
 
 from qmodel.components.amp_scaler import MyScaler
-from qmodel.components.profiler import MyProfiler
+from qmodel.components.profiler import AsyncProfilingHelper, MyProfiler
 from qmodel.components.lr_scheduler import Scheduler
 
 # alias torch cuda event and _cudaeventbase by the same one
 Event: TypeAlias = torch.cuda.Event | torch._C._CudaEventBase
 Stream: TypeAlias = torch.cuda.Stream | torch._C._CudaStreamBase
+
 
 class _AsyncBase:
     device: torch.device
@@ -20,6 +21,7 @@ class _AsyncBase:
     dataloader: Iterable | torch.utils.data.DataLoader
     profiler: MyProfiler
     amp_scaler: MyScaler
+    async_profiling: AsyncProfilingHelper
     valid: bool
 
     def __init__(
@@ -43,6 +45,7 @@ class _AsyncBase:
         self.model_stream: Stream = torch.cuda.Stream(device=self.device)
 
         self.profiler = profiler
+        self.async_profiling = AsyncProfilingHelper()
         self.valid = True
 
         assert num_normal_steps >= 12
@@ -56,11 +59,12 @@ class _AsyncBase:
                 return torch.Tensor(), torch.Tensor(), None, None
 
             with torch.cuda.stream(self.stream1):  # type: ignore
-                assert data.is_pinned()
-                data = data.to(self.device, non_blocking=True)
-                if self.move_target:
-                    assert target.is_pinned()
-                    target = target.to(self.device, non_blocking=True)
+                with self.async_profiling.region("h2d", curr_it, self.stream1):
+                    assert data.is_pinned()
+                    data = data.to(self.device, non_blocking=True)
+                    if self.move_target:
+                        assert target.is_pinned()
+                        target = target.to(self.device, non_blocking=True)
 
             event = torch.cuda.Event()
             event.record(self.stream1)
@@ -109,7 +113,8 @@ class _AsyncBase:
 
             # prev round gbuffer must have completed since they are in same stream
             with torch.cuda.stream(self.model_stream):  # type: ignore
-                output = self._step(data, target, other_meta, curr_it)
+                with self.async_profiling.region("model", curr_it, self.model_stream):
+                    output = self._step(data, target, other_meta, curr_it)
 
             bs = output.shape[0]
             if gbuffer is None:
@@ -125,13 +130,15 @@ class _AsyncBase:
             # loop idx-1: wait for result transfer
             event2.wait(self.model_stream)
             with torch.cuda.stream(self.model_stream):  # type: ignore
-                gbuffer[:bs].copy_(output, non_blocking=True)
+                with self.async_profiling.region("stage", curr_it, self.model_stream):
+                    gbuffer[:bs].copy_(output, non_blocking=True)
             event3.record(self.model_stream)  # event3: complete copy to gbuffer, can reuse output
 
             event3.wait(self.stream2)
             buffer = torch.empty_like(output, pin_memory=True, device="cpu")
             with torch.cuda.stream(self.stream2):  # type: ignore
-                buffer.copy_(gbuffer[:bs], non_blocking=True)
+                with self.async_profiling.region("d2h", curr_it, self.stream2):
+                    buffer.copy_(gbuffer[:bs], non_blocking=True)
             event2.record(self.stream2)    # event2: complete copy to host, can reuse gbuffer
 
             # one-time event used in async post-step
@@ -157,9 +164,11 @@ class _AsyncBase:
         before we do anything with it
         """
 
-        event.synchronize()
+        with self.async_profiling.region("post_wait", curr_it, None):
+            event.synchronize()
         with torch.profiler.record_function(f"_post_step_{curr_it}"):
-            self._post_step(res, buffer, target, other_meta, curr_it)
+            with self.async_profiling.region("post", curr_it, None):
+                self._post_step(res, buffer, target, other_meta, curr_it)
 
 class _SyncBase:
     device: torch.device

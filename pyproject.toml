@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qmodel"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Modular training and evaluation utilities"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,10 +21,15 @@ dependencies = [
 where = ["."]
 include = ["qmodel*"]
 
+[tool.setuptools.dynamic]
+version = {attr = "qmodel.version.__version__"}
+
 [project.optional-dependencies]
 dev = [
+  "build",
   "pytest",
   "pytest-cov",
+  "twine",
 ]
 
 [tool.pytest.ini_options]
