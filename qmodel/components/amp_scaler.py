@@ -57,6 +57,15 @@ class MyScaler:
             assert isinstance(state, dict)
             self._scaler.load_state_dict(state)
 
+    def get_scale(self) -> float:
+        """Return current scaling factor for logging/monitoring."""
+        if self._scaler is None:
+            return 1.0
+        if hasattr(self._scaler, "get_scale"):
+            return float(self._scaler.get_scale())
+        # torch GradScaler stores scale tensor on device; cast to float
+        return float(self._scaler._scale.cpu().item())
+
 
 class CudaGraphAMPScaler:
     def __init__(self, init_scale=2.**16, growth=2.0, backoff=0.5, growth_interval=2000, device="cuda"):
@@ -124,3 +133,6 @@ class CudaGraphAMPScaler:
         self.scaler.mul_(factor)
         # 达到增长后把计数器清零（张量化）
         self.step_counter.mul_(1.0 - grow_mask)
+
+    def get_scale(self) -> float:
+        return float(self.scaler.item())

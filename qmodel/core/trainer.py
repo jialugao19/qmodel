@@ -113,3 +113,49 @@ class Trainer(AsyncTrainer):
 
             self.writer.add_scalar('Loss/Train', loss_val, curr_it)
             self.writer.add_scalar('lr', self.optimizer.param_groups[0]['lr'], curr_it)
+            self.writer.add_scalar('Loss/TrainMean', np.nanmean(res), curr_it)
+            self._log_param_stats(curr_it)
+
+    def _log_param_stats(self, curr_it: int):
+        """Write per-parameter norm and gradient statistics to TensorBoard."""
+        param_norms: list[tuple[str, float]] = []
+        grad_norms: list[tuple[str, float]] = []
+
+        for name, param in self.model.named_parameters():
+            if param is None:
+                continue
+
+            tensor = param.detach()
+            if tensor.dtype != torch.float32:
+                tensor = tensor.to(dtype=torch.float32)
+            norm = torch.linalg.vector_norm(tensor).item()
+            param_norms.append((name, norm))
+
+            grad = param.grad
+            if grad is not None:
+                grad_tensor = grad.detach()
+                if grad_tensor.dtype != torch.float32:
+                    grad_tensor = grad_tensor.to(dtype=torch.float32)
+                grad_norm = torch.linalg.vector_norm(grad_tensor).item()
+                grad_norms.append((name, grad_norm))
+
+        for name, value in param_norms:
+            self.writer.add_scalar(f'ParamNorm/{name}', value, curr_it)
+
+        for name, value in grad_norms:
+            self.writer.add_scalar(f'GradNorm/{name}', value, curr_it)
+
+        if param_norms:
+            values = [v for _, v in param_norms]
+            self.writer.add_scalar('ParamNorm/max', max(values), curr_it)
+            self.writer.add_scalar('ParamNorm/min', min(values), curr_it)
+            self.writer.add_scalar('ParamNorm/mean', float(np.mean(values)), curr_it)
+
+        if grad_norms:
+            gvalues = [v for _, v in grad_norms]
+            self.writer.add_scalar('GradNorm/max', max(gvalues), curr_it)
+            self.writer.add_scalar('GradNorm/min', min(gvalues), curr_it)
+            self.writer.add_scalar('GradNorm/mean', float(np.mean(gvalues)), curr_it)
+
+        amp_scale = self.amp_scaler.get_scale()
+        self.writer.add_scalar('AMP/scale', amp_scale, curr_it)
