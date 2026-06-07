@@ -2,11 +2,13 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 
 from qmodel.core.eval_trainer import AsyncTrainer, SyncTrainer
 from qmodel.core.evaluator import Evaluator
+from qmodel.components.distributed import DistributedContext
 from qmodel.components.lr_scheduler import custom_scheduler
 from qmodel.components.checkpoint import CheckpointSaver
 from qmodel.components.amp_scaler import MyScaler
@@ -22,35 +24,68 @@ import time
 
 class Trainer(AsyncTrainer):
     def __init__(self, config: QConfig) -> None:
+        """Build the training runtime from config."""
+        # Initialize distributed placement before constructing CUDA modules.
         self.config = config
+        self.distributed = DistributedContext.from_config(config)
+        self.config.device = self.distributed.device
 
-        device = config.device
+        # Build model, optimizer, scheduler, scaler, and profiler.
+        device = self.distributed.device
         dtype  = config.train_dtype
-        model     = build_model(config.model_class, config.model).to(device=device, dtype=dtype)
+        raw_model = build_model(config.model_class, config.model).to(device=device, dtype=dtype)
         loss_fn   = config.criterion
         lr        = config.learning_rate
-        optimizer = config.optimizer_class(model.parameters(), lr=lr)
+        optimizer = config.optimizer_class(raw_model.parameters(), lr=lr)
         lr_sched  = custom_scheduler(optimizer, config)
         amp_scaler  = MyScaler(config.use_amp, config.amp_dtype)
 
+        # Use manual gradient sync for DDP CUDA graph training.
+        manual_gradient_sync = self.distributed.enabled and config.train_use_cuda_graph
+        if manual_gradient_sync:
+            self.distributed.broadcast_module(raw_model)
+
+        # Wrap the model in DDP for eager distributed training.
+        model: nn.Module = raw_model
+        if self.distributed.enabled and not manual_gradient_sync:
+            model = DistributedDataParallel(
+                raw_model,
+                device_ids=[self.distributed.local_rank],
+                output_device=self.distributed.local_rank,
+            )
+
+        # Build the profiler and rank-local dataloader.
         do_profile  = config.profiler.profile_section == "train"
         profiler    = MyProfiler(real_run=do_profile, config=config.profiler)
 
-        dataloader, sampler = setup_train_dataloader(config, group="train", shuffle=True)
+        dataloader, sampler = setup_train_dataloader(
+            config,
+            group="train",
+            shuffle=True,
+            distributed=self.distributed,
+        )
 
+        # Configure CUDA graph warmup behavior.
         num_normal_steps = config.num_normal_steps if config.train_use_cuda_graph else 9999999999
 
         super().__init__(
             model=model, dataloader=dataloader, loss_fn=loss_fn, lr_sched=lr_sched, amp_scaler=amp_scaler, profiler=profiler,
-            optimizer=optimizer, device=device, num_normal_steps=num_normal_steps
+            optimizer=optimizer, device=device, num_normal_steps=num_normal_steps,
+            distributed=self.distributed,
         )
 
-        self.evaluator = Evaluator(config, group="test")
+        # Store raw model and evaluator for checkpoint/eval paths.
+        self.raw_model = raw_model
+        self.graph_model = raw_model
+        self.manual_gradient_sync = manual_gradient_sync
+        self.evaluator = Evaluator(config, group="test", distributed=self.distributed)
 
-        os.makedirs(config.root_dir, exist_ok=True)
-        os.makedirs(config.tensorboard_dir, exist_ok=True)
+        # Create persistent writers on rank zero.
+        if self.distributed.is_main:
+            os.makedirs(config.root_dir, exist_ok=True)
+            os.makedirs(config.tensorboard_dir, exist_ok=True)
 
-        self.writer = SummaryWriter(log_dir=config.tensorboard_dir)
+        self.writer = SummaryWriter(log_dir=config.tensorboard_dir) if self.distributed.is_main else None
         self.checkpointer = CheckpointSaver(config.root_dir, config, device)
         self.sampler = sampler
         self.start_iter = 0
@@ -65,24 +100,30 @@ class Trainer(AsyncTrainer):
 
         logger.info(f"load from iteration {iteration}")
         self.checkpointer.load(
-            path, self.model, self.optimizer, self.lr_sched, self.amp_scaler
+            path, self.raw_model, self.optimizer, self.lr_sched, self.amp_scaler
         )
         self.sampler.set_start_iter(iteration * self.config.batch_size)
         self.start_iter = iteration
+        self.distributed.barrier()
 
     def train(self):
         assert isinstance(self.dataloader, torch.utils.data.DataLoader)
         n_iter = min(len(self.dataloader), self.config.num_iters)
         res = self.run(n_iter=n_iter, start=self.start_iter, use_tqdm=False)
-        self.writer.close()
+        if self.writer is not None:
+            self.writer.close()
         return res
 
     def _pre_step(self, curr_it):
         if curr_it % self.config.save_every == 0:
-            self.checkpointer.save(
-                self.model, self.optimizer, self.lr_sched,
-                self.amp_scaler, curr_it
-            )
+            # Finish async training work before materializing checkpoint tensors.
+            torch.cuda.synchronize(self.device)
+            if self.distributed.is_main:
+                self.checkpointer.save(
+                    self.raw_model, self.optimizer, self.lr_sched,
+                    self.amp_scaler, curr_it
+                )
+            self.distributed.barrier()
 
         if self.config.eval_during and \
             curr_it % self.config.eval_every == 0:
@@ -93,12 +134,19 @@ class Trainer(AsyncTrainer):
             )
             torch.cuda.empty_cache()
 
-            ret_col = self.config.ret_col_name
-            for k, v in metrics.items():
-                self.writer.add_scalar(f'{ret_col}/{k}', v, curr_it)
+            if self.distributed.is_main:
+                assert self.writer is not None
+                ret_col = self.config.ret_col_name
+                for k, v in metrics.items():
+                    self.writer.add_scalar(f'{ret_col}/{k}', v, curr_it)
 
     def _post_step(self, res, buffer, target, other_meta, curr_it):
+        """Log rank-zero train metrics after one train step."""
+        # Keep persistent logging on rank zero only.
+        if not self.distributed.is_main:
+            return
 
+        # Update the rolling loss window.
         loss_length = self.config.mean_loss_length
         if len(res) < loss_length:
             res.extend([np.nan for _ in range(loss_length-len(res))])
@@ -106,6 +154,9 @@ class Trainer(AsyncTrainer):
         loss_val = buffer.item()
         res[curr_it % loss_length] = loss_val
         if curr_it % self.config.log_every == 0:
+            assert self.writer is not None
+
+            # Write scalar train metrics.
             logger.info(
                 f'Time: {time.strftime("%Y-%m-%d %H:%M:%S")}, '
                 f'Batch {curr_it}: Loss: {loss_val:.4f}, Mean loss: {np.nanmean(res):.4f}'
@@ -118,19 +169,23 @@ class Trainer(AsyncTrainer):
 
     def _log_param_stats(self, curr_it: int):
         """Write per-parameter norm and gradient statistics to TensorBoard."""
+        # Collect raw model parameter and gradient norms.
+        assert self.writer is not None
         param_norms: list[tuple[str, float]] = []
         grad_norms: list[tuple[str, float]] = []
 
-        for name, param in self.model.named_parameters():
+        for name, param in self.raw_model.named_parameters():
             if param is None:
                 continue
 
+            # Convert parameter norm to a scalar for TensorBoard.
             tensor = param.detach()
             if tensor.dtype != torch.float32:
                 tensor = tensor.to(dtype=torch.float32)
             norm = torch.linalg.vector_norm(tensor).item()
             param_norms.append((name, norm))
 
+            # Convert gradient norm to a scalar for TensorBoard.
             grad = param.grad
             if grad is not None:
                 grad_tensor = grad.detach()
@@ -139,23 +194,27 @@ class Trainer(AsyncTrainer):
                 grad_norm = torch.linalg.vector_norm(grad_tensor).item()
                 grad_norms.append((name, grad_norm))
 
+        # Write per-parameter metrics.
         for name, value in param_norms:
             self.writer.add_scalar(f'ParamNorm/{name}', value, curr_it)
 
         for name, value in grad_norms:
             self.writer.add_scalar(f'GradNorm/{name}', value, curr_it)
 
+        # Write aggregate parameter norm metrics.
         if param_norms:
             values = [v for _, v in param_norms]
             self.writer.add_scalar('ParamNorm/max', max(values), curr_it)
             self.writer.add_scalar('ParamNorm/min', min(values), curr_it)
             self.writer.add_scalar('ParamNorm/mean', float(np.mean(values)), curr_it)
 
+        # Write aggregate gradient norm metrics.
         if grad_norms:
             gvalues = [v for _, v in grad_norms]
             self.writer.add_scalar('GradNorm/max', max(gvalues), curr_it)
             self.writer.add_scalar('GradNorm/min', min(gvalues), curr_it)
             self.writer.add_scalar('GradNorm/mean', float(np.mean(gvalues)), curr_it)
 
+        # Write AMP scale for the current train step.
         amp_scale = self.amp_scaler.get_scale()
         self.writer.add_scalar('AMP/scale', amp_scale, curr_it)

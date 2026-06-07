@@ -8,6 +8,7 @@ from tqdm import tqdm
 from qmodel.components.amp_scaler import MyScaler
 from qmodel.components.profiler import AsyncProfilingHelper, MyProfiler
 from qmodel.components.lr_scheduler import Scheduler
+from qmodel.components.distributed import DistributedContext
 
 # alias torch cuda event and _cudaeventbase by the same one
 Event: TypeAlias = torch.cuda.Event | torch._C._CudaEventBase
@@ -18,9 +19,12 @@ class _AsyncBase:
     device: torch.device
     move_target: bool
     model: nn.Module
+    graph_model: nn.Module
     dataloader: Iterable | torch.utils.data.DataLoader
     profiler: MyProfiler
     amp_scaler: MyScaler
+    distributed: DistributedContext
+    manual_gradient_sync: bool
     async_profiling: AsyncProfilingHelper
     valid: bool
 
@@ -28,16 +32,23 @@ class _AsyncBase:
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         amp_scaler: MyScaler, profiler: MyProfiler,
         device: torch.device, move_target: bool,
-        num_normal_steps: int
+        num_normal_steps: int,
+        distributed: DistributedContext | None = None,
     ):
+        """Initialize async execution resources."""
+        # Store model, device, and dataloader state.
         self.device = torch.device(device)
         self.move_target = move_target
 
         self.model = model
+        self.graph_model = model
         self.dataloader = dataloader
         self.it = iter(dataloader)
+        self.distributed = distributed if distributed is not None else DistributedContext.single(self.device)
+        self.manual_gradient_sync = False
         self.amp_scaler = amp_scaler
 
+        # Create CPU executors and CUDA streams.
         self.ex = ThreadPoolExecutor(max_workers=1)
         self.ex2 = ThreadPoolExecutor(max_workers=1)
         self.stream1: Stream = torch.cuda.Stream(device=self.device)   # host->device
@@ -92,7 +103,7 @@ class _AsyncBase:
         self._init()
 
         self.profiler.start(sleep_sec=2)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(self.device)
 
         res, gbuffer = [], None
         event2, event3 = torch.cuda.Event(), torch.cuda.Event()
@@ -150,7 +161,7 @@ class _AsyncBase:
             self.ex2.submit(self._post_step_async, res, buffer, target, other_meta, curr_it, event4)
             self.profiler.step()
 
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(self.device)
         self.profiler.stop()
         self.ex.shutdown(wait=True)
         self.ex2.shutdown(wait=True)
@@ -174,21 +185,28 @@ class _SyncBase:
     device: torch.device
     move_target: bool
     model: nn.Module
+    graph_model: nn.Module
     dataloader: Iterable | torch.utils.data.DataLoader
     profiler: MyProfiler
     amp_scaler: MyScaler
+    distributed: DistributedContext
+    manual_gradient_sync: bool
     valid: bool
 
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         amp_scaler: MyScaler, profiler: MyProfiler,
         device: torch.device, move_target: bool,
-        num_normal_steps: int
+        num_normal_steps: int,
+        distributed: DistributedContext | None = None,
     ):
         self.device = torch.device(device)
         self.move_target = move_target
         self.model = model
+        self.graph_model = model
         self.dataloader = dataloader
+        self.distributed = distributed if distributed is not None else DistributedContext.single(self.device)
+        self.manual_gradient_sync = False
         self.amp_scaler = amp_scaler
         self.model_stream: Stream = torch.cuda.Stream(device=self.device)
 
@@ -219,7 +237,7 @@ class _SyncBase:
         self._init()
 
         self.profiler.start(sleep_sec=2)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(self.device)
 
         res = []
         it = iter(self.dataloader)
@@ -238,13 +256,13 @@ class _SyncBase:
 
             with torch.cuda.stream(self.model_stream):  # type: ignore
                 output = self._step(data, target, other_meta, curr_it)
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self.device)
             buffer = output.cpu()
 
             self._post_step(res, buffer, target, other_meta, curr_it)
             self.profiler.step()
 
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(self.device)
         self.profiler.stop()
 
         return res
@@ -252,6 +270,7 @@ class _SyncBase:
 
 class InferenceProto(Protocol):
     model: nn.Module
+    graph_model: nn.Module
     device: torch.device
     amp_scaler: MyScaler
 
@@ -267,11 +286,14 @@ class InferenceProto(Protocol):
 
 class TrainProto(Protocol):
     model: nn.Module
+    graph_model: nn.Module
     device: torch.device
     optimizer: torch.optim.Optimizer
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
     lr_sched: Scheduler
     amp_scaler: MyScaler
+    distributed: DistributedContext
+    manual_gradient_sync: bool
 
     num_normal_steps: int
 
@@ -305,16 +327,17 @@ class InferenceMixin:
             self._g = torch.cuda.CUDAGraph()
             self._static_inputs = (data.clone(), torch.tensor(0, device=self.device))
             self._static_outputs = torch.zeros_like(target, device=self.device)
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self.device)
 
             # it looks like everything is not updated but only recorded,
             # so we have to replay once
-            with torch.cuda.graph(self._g):
-                with torch.no_grad(), self.amp_scaler.autocast():
-                    output = self.model(self._static_inputs[0])
-                    self._static_outputs.copy_(output)
+            with torch.cuda.stream(self.model_stream):  # type: ignore
+                with torch.cuda.graph(self._g, stream=self.model_stream, capture_error_mode="relaxed"):
+                    with torch.no_grad(), self.amp_scaler.autocast():
+                        output = self.model(self._static_inputs[0])
+                        self._static_outputs.copy_(output)
 
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self.device)
         else:
             # replay
             assert self._static_inputs is not None
@@ -345,6 +368,16 @@ class TrainMixin:
         self._static_inputs = None
         self._static_outputs = None
 
+    def _report_loss(self: TrainProto, loss: torch.Tensor) -> torch.Tensor:
+        """Return the global loss tensor used by logging."""
+        # Detach scalar loss from autograd and make it batch-shaped.
+        loss2 = loss.detach()
+        if loss2.dim() == 0:
+            loss2 = loss2.unsqueeze(0)
+
+        # Average report loss across DDP ranks.
+        return self.distributed.average(loss2.clone())
+
     def _normal_step(self: TrainProto, data, target, other_meta, curr_it) -> torch.Tensor:
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -353,48 +386,56 @@ class TrainMixin:
             loss = self.loss_fn(output, target.to(dtype=output.dtype))
 
         self.amp_scaler.scale(loss).backward()
+        if self.manual_gradient_sync:
+            self.distributed.average_gradients(self.graph_model.parameters())
         self.amp_scaler.step(self.optimizer)
         self.amp_scaler.update()
 
         self.lr_sched.step()
 
-        loss2 = loss.detach()
-        if loss2.dim() == 0:
-            loss2.unsqueeze_(0)
-        return loss2
+        return self._report_loss(loss)
 
     def _step(self: TrainProto, data: torch.Tensor, target: torch.Tensor, other_meta, curr_it: int) -> torch.Tensor:
+        """Run one train step, using CUDA graph after warmup."""
+        # Use eager execution during warmup.
         if curr_it <= self.num_normal_steps:
             v = self._normal_step(data, target, other_meta, curr_it)
             return v
 
+        # Use a manual gradient-reduction graph path for DDP.
+        if self.distributed.enabled:
+            return self._distributed_graph_step(data, target, curr_it)
+
+        # Capture the steady-state training graph once.
         if self._g is None:
-            # capture
             self._g = torch.cuda.CUDAGraph()
             self._static_inputs = (data.clone(), target.to(dtype=data.dtype).clone())
             self._static_outputs = torch.empty(1, device=self.device)
-            torch.cuda.synchronize()
+            self.distributed.barrier()
+            torch.cuda.synchronize(self.device)
 
             # copy data to static input
             self.optimizer.zero_grad(set_to_none=True)
 
             # it looks like everything is not updated but only recorded,
             # so we have to replay once
-            with torch.cuda.graph(self._g):
-                with self.amp_scaler.autocast():
-                    output = self.model(self._static_inputs[0])
-                    loss = self.loss_fn(output, self._static_inputs[1])
-                    self._static_outputs.copy_(loss)
+            with torch.cuda.stream(self.model_stream):  # type: ignore
+                with torch.cuda.graph(self._g, stream=self.model_stream, capture_error_mode="relaxed"):
+                    with self.amp_scaler.autocast():
+                        output = self.model(self._static_inputs[0])
+                        loss = self.loss_fn(output, self._static_inputs[1])
 
-                self.amp_scaler.scale(self._static_outputs).backward()
+                    self.amp_scaler.scale(loss).backward()
+                    self._static_outputs.copy_(loss.detach())
                 self.amp_scaler.step(self.optimizer)
                 self.amp_scaler.update()
                 self.lr_sched.step()
 
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self.device)
+            self.distributed.barrier()
 
         else:
-            # replay
+            # Replay the captured graph with new static inputs.
             assert self._static_inputs is not None
             assert self._static_outputs is not None
 
@@ -408,10 +449,51 @@ class TrainMixin:
 
         self._g.replay()
 
-        loss2 = self._static_outputs.detach()
-        if loss2.dim() == 0:
-            loss2.unsqueeze_(0)
-        return loss2
+        # Return the global report loss.
+        return self._report_loss(self._static_outputs)
+
+    def _distributed_graph_step(self: TrainProto, data: torch.Tensor, target: torch.Tensor, curr_it: int) -> torch.Tensor:
+        """Run one DDP CUDA graph train step."""
+        # Capture forward/backward without DDP reducer collectives.
+        if self._g is None:
+            self._g = torch.cuda.CUDAGraph()
+            self._static_inputs = (data.clone(), target.to(dtype=data.dtype).clone())
+            self._static_outputs = torch.empty(1, device=self.device)
+            self.distributed.barrier()
+            torch.cuda.synchronize(self.device)
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.stream(self.model_stream):  # type: ignore
+                with torch.cuda.graph(self._g, stream=self.model_stream, capture_error_mode="relaxed"):
+                    with self.amp_scaler.autocast():
+                        output = self.graph_model(self._static_inputs[0])
+                        loss = self.loss_fn(output, self._static_inputs[1])
+
+                    self.amp_scaler.scale(loss).backward()
+                    self._static_outputs.copy_(loss.detach())
+
+            torch.cuda.synchronize(self.device)
+            self.distributed.barrier()
+
+        else:
+            # Update static input buffers for graph replay.
+            assert self._static_inputs is not None
+            assert self._static_outputs is not None
+
+            if self._static_inputs[0].shape[0] != data.shape[0]:
+                return self._normal_step(data, target, None, curr_it)
+
+            self._static_inputs[0].copy_(data)
+            self._static_inputs[1].copy_(target.to(dtype=data.dtype))
+
+        # Replay the local compute graph and apply synchronized optimizer state.
+        self.optimizer.zero_grad(set_to_none=False)
+        self._g.replay()
+        self.distributed.average_gradients(self.graph_model.parameters())
+        self.amp_scaler.step(self.optimizer)
+        self.amp_scaler.update()
+        self.lr_sched.step()
+        return self._report_loss(self._static_outputs)
 
 
     def _pre_step(self, curr_it):
@@ -425,24 +507,28 @@ class AsyncInference(InferenceMixin, _AsyncBase):
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         amp_scaler: MyScaler, profiler: MyProfiler,
-        device: torch.device, num_normal_steps: int
+        device: torch.device, num_normal_steps: int,
+        distributed: DistributedContext | None = None,
     ):
         super().__init__(
             model=model, dataloader=dataloader,
             amp_scaler=amp_scaler, profiler=profiler, device=device,
-            move_target=False, num_normal_steps=num_normal_steps
+            move_target=False, num_normal_steps=num_normal_steps,
+            distributed=distributed,
         )
 
 class SyncInference(InferenceMixin, _SyncBase):
     def __init__(
         self, model: nn.Module, dataloader: Iterable | torch.utils.data.DataLoader,
         amp_scaler: MyScaler, profiler: MyProfiler,
-        device: torch.device, num_normal_steps: int
+        device: torch.device, num_normal_steps: int,
+        distributed: DistributedContext | None = None,
     ):
         super().__init__(
             model=model, dataloader=dataloader,
             amp_scaler=amp_scaler, profiler=profiler, device=device,
-            move_target=False, num_normal_steps=num_normal_steps
+            move_target=False, num_normal_steps=num_normal_steps,
+            distributed=distributed,
         )
 
 class AsyncTrainer(TrainMixin, _AsyncBase):
@@ -451,12 +537,14 @@ class AsyncTrainer(TrainMixin, _AsyncBase):
         loss_fn: Callable, optimizer: torch.optim.Optimizer,
         lr_sched: Scheduler,
         amp_scaler: MyScaler, profiler: MyProfiler,
-        device: torch.device, num_normal_steps: int
+        device: torch.device, num_normal_steps: int,
+        distributed: DistributedContext | None = None,
     ):
         super().__init__(
             model=model, dataloader=dataloader,
             amp_scaler=amp_scaler, profiler=profiler, device=device,
-            move_target=True, num_normal_steps=num_normal_steps
+            move_target=True, num_normal_steps=num_normal_steps,
+            distributed=distributed,
         )
 
         self.optimizer = optimizer
@@ -469,12 +557,14 @@ class SyncTrainer(TrainMixin, _SyncBase):
         loss_fn: Callable, optimizer: torch.optim.Optimizer,
         lr_sched: Scheduler,
         amp_scaler: MyScaler, profiler: MyProfiler,
-        device: torch.device, num_normal_steps: int
+        device: torch.device, num_normal_steps: int,
+        distributed: DistributedContext | None = None,
     ):
         super().__init__(
             model=model, dataloader=dataloader,
             amp_scaler=amp_scaler, profiler=profiler, device=device,
-            move_target=True, num_normal_steps=num_normal_steps
+            move_target=True, num_normal_steps=num_normal_steps,
+            distributed=distributed,
         )
 
         self.optimizer = optimizer

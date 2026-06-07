@@ -42,8 +42,14 @@ class ModelConfig:
 class EvalConfig:
     eval_checkpoint_iter: Sequence[int] = field(init=False)
     eval_all_num_iters: int = field(init=False)
+    # Global eval batch size; DDP local batch is eval_batch_size // world_size.
     eval_batch_size: int = field(init=False)
     eval_use_cuda_graph: bool = field(init=False)
+
+@dataclass
+class DistributedConfig:
+    enabled: bool = False
+    backend: str = "nccl"
 
 
 # type hint is mandatory to allow dataclass to recognize fields correctly
@@ -79,6 +85,7 @@ class QConfig:
     expr_name: str = field(init=False)
 
     # iteration configuration
+    # Global training batch size; DDP local batch is batch_size // world_size.
     batch_size: int = field(init=False)
     num_workers: int = field(init=False)
     num_iters: int = field(init=False)
@@ -99,4 +106,4 @@ class QConfig:
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
     profiler: ProfilerConfig = field(init=False)
     evaluator: EvalConfig = field(default_factory=EvalConfig)
-
+    distributed: DistributedConfig = field(default_factory=DistributedConfig)

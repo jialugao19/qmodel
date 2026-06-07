@@ -16,6 +16,7 @@ from qmodel.logger import logger
 from qmodel.util import merge_date_time_dataframe
 from qmodel.data.dataloader import setup_eval_dataloader
 from qmodel.core.eval_trainer import AsyncInference, SyncInference
+from qmodel.components.distributed import DistributedContext
 from qmodel.components.profiler import MyProfiler
 from qmodel.components.checkpoint import CheckpointSaver
 from qmodel.components.amp_scaler import MyScaler
@@ -25,9 +26,11 @@ from qmodel.config import QConfig
 
 class Inferencer(AsyncInference):
     def _post_step(self, res, buffer, target, other_meta, curr_it):
+        """Store one local inference batch."""
+        # Accumulate local batches in the original inference result format.
         res.append([buffer, target, other_meta])
         if len(res) >= 100:
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self.device)
             res2 = [torch.cat([r[i] for r in res]) for i in range(len(res[0]))]
             res.clear()
             res.append(res2)
@@ -36,19 +39,34 @@ class Inferencer(AsyncInference):
         pass
 
 class Evaluator:
-    def __init__(self, config: QConfig, group: str):
+    def __init__(
+        self,
+        config: QConfig,
+        group: str,
+        distributed: DistributedContext | None = None,
+    ):
+        """Build an evaluator for one dataset group."""
+        # Store group and distributed runtime context.
         assert group in ["test", "predict"]
         self.config = config
         self.group  = group
+        self.distributed = distributed if distributed is not None else DistributedContext.from_config(config)
+        self.config.device = self.distributed.device
 
-        self.checkpointer = CheckpointSaver(config.root_dir, config, device=None)
+        # Build checkpoint and optional writer handles.
+        self.checkpointer = CheckpointSaver(config.root_dir, config, device=self.distributed.device)
 
-        self.writer = SummaryWriter(log_dir=config.tensorboard_dir)
+        self.writer = SummaryWriter(log_dir=config.tensorboard_dir) if self.distributed.is_main else None
 
     def evaluate(self):
+        """Evaluate configured checkpoints."""
+        # Create output directory on rank zero.
         files = [it for it in self.config.evaluator.eval_checkpoint_iter if it > 0]
-        os.makedirs(os.path.join(self.config.root_dir, "eval"), exist_ok=True)
+        if self.distributed.is_main:
+            os.makedirs(os.path.join(self.config.root_dir, "eval"), exist_ok=True)
+        self.distributed.barrier()
 
+        # Evaluate each checkpoint on every rank.
         for it in files:
             self.eval_single(it, n_iter=self.config.evaluator.eval_all_num_iters)
 
@@ -57,15 +75,21 @@ class Evaluator:
         return res
 
     def eval_single(self, it: int, n_iter=0) -> dict:
+        """Evaluate one checkpoint and return rank-zero metrics."""
+        # Build rank-local evaluation runtime.
         config      = self.config
-        device      = self.config.device
+        device      = self.distributed.device
         amp_scaler  = MyScaler(config.use_amp, config.amp_dtype)
         model       = build_model(config.model_class, config.model).to(device=device, dtype=config.eval_dtype)
         do_profile  = config.profiler.profile_section == "eval"
         profiler    = MyProfiler(real_run=do_profile, config=config.profiler)
 
-        dataloader  = setup_eval_dataloader(self.config, self.group, shuffle=False)
-
+        dataloader  = setup_eval_dataloader(
+            self.config,
+            self.group,
+            shuffle=False,
+            distributed=self.distributed,
+        )
 
         ckpt = Path(self.config.root_dir) / "ckpt" / f"iter_{it}.pt"
 
@@ -76,7 +100,8 @@ class Evaluator:
 
         inferencer = Inferencer(
             model=model, dataloader=dataloader, device=device,
-            amp_scaler=amp_scaler, profiler=profiler, num_normal_steps=num_normal_steps
+            amp_scaler=amp_scaler, profiler=profiler, num_normal_steps=num_normal_steps,
+            distributed=self.distributed,
         )
         if n_iter == 0:
             n_iter = len(dataloader)
@@ -84,10 +109,16 @@ class Evaluator:
         res = inferencer.run(n_iter=n_iter)
         logger.info(f"finish running inference")
 
-        res2 = []
-        if len(res) > 0:
-            for i in range(len(res[0])):
-                res2.append(np.concatenate([r[i] for r in res], axis=0))
+        # Gather rank-local batches and continue only on rank zero.
+        local_rows = self._local_rows(res)
+        gathered_rows = self.distributed.gather_object(local_rows)
+        if not self.distributed.is_main:
+            return {}
+
+        # Reconstruct global eval row order from step and rank.
+        rows = [row for rank_rows in gathered_rows for row in rank_rows]
+        rows.sort(key=lambda row: (row[0], row[1]))
+        res2 = self._concat_rows(rows)
         logger.info(f"finish concat inference")
 
         cols = ['prediction', 'target', 'code', 'date', 'time']
@@ -103,27 +134,62 @@ class Evaluator:
 
         logger.info(f"finish building dataframe")
 
-        # convert date and time to datetime col
+        # Convert date and time to datetime columns.
         res_df["StockCode"] = res_df["code"].astype(int)
         res_df["DateTime"] = merge_date_time_dataframe(res_df, "date", "time")
         logger.info(f"finish converting to datetime")
 
-        # compute global IC
+        # Compute global IC on rank zero.
         start_time = time.time()
         global_ic = np.corrcoef(res_df['prediction'], res_df['target'])[0, 1]
         end_time = time.time()
 
         logger.info(f"global IC: {global_ic:.8f}, computed IC in {end_time-start_time:.3f}s")
 
-        # save to feather
+        # Save evaluation output on rank zero.
         os.makedirs(os.path.join(self.config.root_dir, "eval"), exist_ok=True)
         res_df.to_feather(os.path.join(self.config.root_dir, "eval", f"eval_{it}.feather"))
 
+        # Return scalar metrics to the caller.
         metric_res = {
             "global IC": global_ic
         }
 
         return metric_res
+
+    def _local_rows(self, batches: list) -> list:
+        """Convert local inference chunks into gatherable ordered rows."""
+        # Merge local result chunks without changing Inferencer's output contract.
+        local_arrays = [
+            np.concatenate([
+                batch[field_idx].detach().cpu().numpy()
+                for batch in batches
+            ], axis=0)
+            for field_idx in range(len(batches[0]))
+        ]
+
+        # Split local arrays back into dataloader steps for global ordering.
+        rows = []
+        local_batch_size = self.config.evaluator.eval_batch_size // self.distributed.world_size
+        for local_start in range(0, local_arrays[0].shape[0], local_batch_size):
+            local_end = local_start + local_batch_size
+            rows.append((
+                local_start // local_batch_size,
+                self.distributed.rank,
+                local_arrays[0][local_start:local_end],
+                local_arrays[1][local_start:local_end],
+                local_arrays[2][local_start:local_end],
+            ))
+        return rows
+
+    def _concat_rows(self, rows: list) -> list:
+        """Concatenate globally ordered eval rows."""
+        # Merge prediction, target, and metadata arrays independently.
+        return [
+            np.concatenate([row[2] for row in rows], axis=0),
+            np.concatenate([row[3] for row in rows], axis=0),
+            np.concatenate([row[4] for row in rows], axis=0),
+        ]
 
     def eval_metrics(self, df):
         # todo: include this part
