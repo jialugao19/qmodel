@@ -22,6 +22,10 @@ class DistributedContext:
         if not config.distributed.enabled:
             return cls.single(config.device)
 
+        # Disable PGNCCL watchdog handling before graph-captured DDP collectives.
+        if config.train_use_cuda_graph and config.distributed.backend == "nccl":
+            os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
+
         # Read torchrun process placement and initialize NCCL.
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -47,7 +51,7 @@ class DistributedContext:
         """Synchronize all ranks when DDP is enabled."""
         # DDP collectives are only valid in distributed mode.
         if self.enabled:
-            dist.barrier()
+            dist.barrier(device_ids=[self.local_rank])
 
     def average(self, tensor: torch.Tensor) -> torch.Tensor:
         """Average a tensor across all ranks."""

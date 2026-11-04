@@ -82,48 +82,17 @@ def get_graph_scheduler(optimizer, lr: float, device: torch.device) -> GraphLRSc
     )
 
 
-def get_torch_scheduler(optimizer, lr: float, device: torch.device):
-    """Build the torch scheduler used by the async trainer."""
-    # Build the reference torch scheduler.
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.01,
-        end_factor=0.95,
-        total_iters=19,
-    )
-    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=160 - 19,
-        eta_min=1e-4,
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, main_scheduler],
-        milestones=[19],
-    )
-
-    # Restore lr as a CUDA tensor for graph-compatible optimizer state.
-    for group in optimizer.param_groups:
-        group["lr"] = torch.tensor(lr * 0.01, device=device, dtype=torch.float64, requires_grad=False)
-    return scheduler
+def _assert_zero_error(left: torch.Tensor, right: torch.Tensor):
+    """Assert tensors are exactly equal."""
+    # Compare CPU copies so tensors from different GPUs can be checked directly.
+    left_cpu = left.detach().cpu()
+    right_cpu = right.detach().cpu()
+    if not torch.equal(left_cpu, right_cpu):
+        max_abs = (left_cpu - right_cpu).abs().max().item()
+        assert False, max_abs
 
 
-def _relative_l2(left: torch.Tensor, right: torch.Tensor) -> float:
-    """Measure relative L2 error between two tensors."""
-    # Compare tensors on CPU with float64 precision.
-    left_cpu = left.detach().cpu().to(dtype=torch.float64)
-    right_cpu = right.detach().cpu().to(dtype=torch.float64)
-    return (((left_cpu - right_cpu)**2).sum() / (left_cpu**2).sum()).item() ** 0.5
-
-
-def _assert_relative_l2(left: torch.Tensor, right: torch.Tensor, tolerance: float):
-    """Assert tensors differ only slightly."""
-    # Check the relative L2 error against the requested tolerance.
-    rel_l2 = _relative_l2(left, right)
-    assert rel_l2 <= tolerance, rel_l2
-
-
-def test_multi_gpu_eval_trainer_allows_small_diff():
+def test_multi_gpu_eval_trainer_has_zero_error():
     """Compare sync and async trainers across two GPUs."""
     # Configure the deterministic two-GPU workload.
     device1 = torch.device("cuda:0")
@@ -133,7 +102,6 @@ def test_multi_gpu_eval_trainer_allows_small_diff():
     seed = 42
     dtype = torch.float64
     lr = 1e-2
-    tolerance = 1e-12
 
     # Build identical models and optimizers on separate GPUs.
     model1 = get_model(dtype, device1)
@@ -141,7 +109,7 @@ def test_multi_gpu_eval_trainer_allows_small_diff():
     optim1 = torch.optim.Adam(model1.parameters(), lr)
     optim2 = torch.optim.Adam(model2.parameters(), lr)
     sched1 = get_graph_scheduler(optim1, lr, device1)
-    sched2 = get_torch_scheduler(optim2, lr, device2)
+    sched2 = get_graph_scheduler(optim2, lr, device2)
 
     # Build scalers and profilers for train and eval paths.
     amp_dtype = torch.float32
@@ -170,12 +138,12 @@ def test_multi_gpu_eval_trainer_allows_small_diff():
     trainer2._pre_step = lambda curr_it: curr_it  # type: ignore
     res2 = trainer2.run(n_iter=n_sample//bs)
 
-    # Allow only small numeric drift in train losses and final parameters.
+    # Require zero drift in train losses and final parameters.
     train_loss1 = torch.utils.data.default_collate(res1)
     train_loss2 = torch.utils.data.default_collate(res2)
-    _assert_relative_l2(train_loss1, train_loss2, tolerance)
+    _assert_zero_error(train_loss1, train_loss2)
     for param1, param2 in zip(model1.parameters(), model2.parameters()):
-        _assert_relative_l2(param1, param2, tolerance)
+        _assert_zero_error(param1, param2)
 
     # Run inference with both trained models on their own GPUs.
     dataloader1 = get_dataloader(n_sample, bs, dtype, seed)
@@ -190,7 +158,7 @@ def test_multi_gpu_eval_trainer_allows_small_diff():
     eval2._pre_step = lambda curr_it: curr_it  # type: ignore
     eval_res2 = eval2.run(n_iter=n_sample//bs)
 
-    # Allow only small numeric drift in inference outputs.
+    # Require zero drift in inference outputs.
     pred1 = torch.utils.data.default_collate(eval_res1)[0]
     pred2 = torch.utils.data.default_collate(eval_res2)[0]
-    _assert_relative_l2(pred1, pred2, tolerance)
+    _assert_zero_error(pred1, pred2)

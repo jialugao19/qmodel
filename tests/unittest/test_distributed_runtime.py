@@ -159,6 +159,9 @@ def _make_config(use_cuda_graph: bool) -> RuntimeConfig:
     config = RuntimeConfig()
     config.train_use_cuda_graph = use_cuda_graph
     config.num_iters = 14 if use_cuda_graph else 4
+    if use_cuda_graph:
+        config.use_amp = "custom"
+        config.amp_dtype = torch.float16
     config.root_dir = f"train_logs/ddp_smoke_{mode}"
     config.tensorboard_dir = f"runs/ddp_smoke_{mode}"
     config.profiler = ProfilerConfig("none", "")
@@ -227,6 +230,23 @@ def _relative_l2(left_path: Path, right_path: Path) -> float:
     left = _load_state_vector(left_path)
     right = _load_state_vector(right_path)
     return torch.linalg.vector_norm(left - right).item() / torch.linalg.vector_norm(left).item()
+
+
+def _assert_state_file_equal(left_path: Path, right_path: Path):
+    """Assert two saved model state files are exactly equal."""
+    # Load state dictionaries from both training runs.
+    left = torch.load(left_path, map_location="cpu", weights_only=True)
+    right = torch.load(right_path, map_location="cpu", weights_only=True)
+    assert left.keys() == right.keys()
+
+    # Require every tensor to match exactly.
+    for name in sorted(left):
+        left_tensor = left[name]
+        right_tensor = right[name]
+        assert left_tensor.dtype == right_tensor.dtype, name
+        if not torch.equal(left_tensor, right_tensor):
+            max_abs = (left_tensor.to(dtype=torch.float64) - right_tensor.to(dtype=torch.float64)).abs().max().item()
+            assert False, f"{name}: {max_abs}"
 
 
 def _checkpoint_model_relative_l2(left_path: Path, right_path: Path) -> float:
@@ -470,11 +490,10 @@ def test_launch_ddp_three_card_parity():
         f"{__file__}::test_ddp_three_card_parity",
     ], check=True)
 
-    # Assert the final trained parameters are nearly identical.
+    # Assert the final trained parameters are exactly identical.
     single_path = PARITY_SINGLE_ROOT / PARITY_FINAL_STATE
     ddp_path = PARITY_DDP_ROOT / PARITY_FINAL_STATE
-    rel_l2 = _relative_l2(single_path, ddp_path)
-    assert rel_l2 <= PARITY_TOLERANCE, rel_l2
+    _assert_state_file_equal(single_path, ddp_path)
 
 
 def test_launch_ddp_checkpoint_resume_parity():

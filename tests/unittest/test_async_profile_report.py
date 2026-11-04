@@ -1,15 +1,22 @@
 import json
 import logging
+import os
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
 import matplotlib
+import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 
 from qmodel.components.amp_scaler import MyScaler
+from qmodel.components.distributed import DistributedContext
 from qmodel.components.profiler import AsyncProfilingHelper, MyProfiler
 from qmodel.config import ProfilerConfig
 from qmodel.core.eval_trainer import AsyncTrainer
@@ -24,6 +31,7 @@ PROFILE_N_ITER = 50
 PROFILE_BATCH_SIZE = 128
 PROFILE_FEATURE_DIM = 256
 PROFILE_HIDDEN_DIM = 512
+PROFILE_WORLD_SIZE = 2
 PROFILE_OUTPUT_DIR = Path("runs/async_profile_smoke")
 PROFILE_CUDA_SPIN_CYCLES_PER_MS = 1_500_000
 
@@ -67,6 +75,14 @@ class TimelineSpan:
         return self.end_ms - self.start_ms
 
 
+@dataclass
+class P2PCommSummary:
+    step: int
+    count: int
+    total_ms: float
+    max_ms: float
+
+
 class TinyRegressor(nn.Module):
     def __init__(self, feature_dim: int, hidden_dim: int):
         """Build a small GPU-heavy regression model."""
@@ -85,6 +101,14 @@ class TinyRegressor(nn.Module):
         """Run the regression network."""
         # Apply the model to one training batch.
         return self.net(data)
+
+
+class ProfiledAsyncTrainer(AsyncTrainer):
+    def _step(self, data, target, other_meta, curr_it) -> torch.Tensor:
+        """Run one train step inside a profiler step window."""
+        # Add a CPU profiler range that owns DDP all-reduce launches for this step.
+        with torch.profiler.record_function(f"train_step_{curr_it}"):
+            return super()._step(data, target, other_meta, curr_it)
 
 
 def _stage_name_from_start_marker(name: str) -> str | None:
@@ -216,19 +240,39 @@ def _post_step(res: list, buffer: torch.Tensor, target, other_meta, curr_it: int
     res.append(buffer.detach().clone())
 
 
-def _make_trainer(recorder: AsyncTimelineRecorder) -> AsyncTrainer:
-    """Build an instrumented AsyncTrainer smoke workload."""
-    # Build model and optimizer on CUDA.
-    device = torch.device("cuda")
-    model = TinyRegressor(PROFILE_FEATURE_DIM, PROFILE_HIDDEN_DIM).to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+def _make_trainer(recorder: AsyncTimelineRecorder, profile_dir: Path) -> AsyncTrainer:
+    """Build an instrumented DDP AsyncTrainer smoke workload."""
+    # Initialize distributed placement for this torchrun rank.
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl")
+    distributed = DistributedContext(True, rank, world_size, local_rank, device)
+
+    # Build a DDP model and optimizer on the rank-local CUDA device.
+    raw_model = TinyRegressor(PROFILE_FEATURE_DIM, PROFILE_HIDDEN_DIM).to(device)
+    model = DistributedDataParallel(
+        raw_model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+    )
+    optimizer = torch.optim.SGD(raw_model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step_idx: 1.0)
 
     # Build async trainer inputs.
     dataloader = _make_dataloader(PROFILE_N_ITER + 2, PROFILE_BATCH_SIZE, PROFILE_FEATURE_DIM)
     scaler = MyScaler("none", torch.float32)
-    profiler = MyProfiler(False, ProfilerConfig("none", ""))
-    trainer = AsyncTrainer(
+    profiler = MyProfiler(True, ProfilerConfig(
+        "train",
+        profile_dir.as_posix(),
+        wait=0,
+        warmup=1,
+        active=PROFILE_N_ITER + 4,
+        repeat=1,
+    ))
+    trainer = ProfiledAsyncTrainer(
         model,
         dataloader,
         nn.MSELoss(),
@@ -238,6 +282,7 @@ def _make_trainer(recorder: AsyncTimelineRecorder) -> AsyncTrainer:
         profiler,
         device,
         num_normal_steps=999999,
+        distributed=distributed,
     )
 
     # Attach simple callbacks for the smoke profile.
@@ -299,6 +344,14 @@ def _load_trace_events(trace_path: Path) -> list[dict]:
     return trace_data["traceEvents"]
 
 
+def _find_myprofiler_trace_path(profile_dir: Path) -> Path:
+    """Return the trace JSON written by MyProfiler."""
+    # MyProfiler writes one tensorboard chrome trace under profile_dir.
+    trace_paths = sorted(profile_dir.glob("*.pt.trace.json"))
+    assert len(trace_paths) == 1
+    return trace_paths[0]
+
+
 def _trace_event_summary(trace_path: Path, step_t: int) -> dict[str, int]:
     """Count source profiler ranges in the selected step window."""
     # Pick the source-level record_function names we expect in trace.
@@ -320,6 +373,120 @@ def _trace_event_summary(trace_path: Path, step_t: int) -> dict[str, int]:
         if event.get("ph") == "X" and name in counts:
             counts[name] += 1
     return counts
+
+
+def _event_name(event: dict) -> str:
+    """Return the trace event name as a string."""
+    # Normalize missing names to an empty string.
+    return str(event.get("name", ""))
+
+
+def _event_category(event: dict) -> str:
+    """Return the trace event category as a string."""
+    # Normalize missing categories to an empty string.
+    return str(event.get("cat", ""))
+
+
+def _event_external_id(event: dict) -> int | None:
+    """Return the profiler external id for one trace event."""
+    # Read the profiler id stored in trace args.
+    args = event.get("args", {})
+    external_id = args.get("External id")
+    if external_id is None:
+        return None
+    return int(external_id)
+
+
+def _event_start_us(event: dict) -> float:
+    """Return a trace event start timestamp in microseconds."""
+    # Chrome trace timestamps are already stored in microseconds.
+    return float(event["ts"])
+
+
+def _event_end_us(event: dict) -> float:
+    """Return a trace event end timestamp in microseconds."""
+    # Add complete-event duration to the start timestamp.
+    return _event_start_us(event) + float(event.get("dur", 0.0))
+
+
+def _contains_time_us(event: dict, timestamp_us: float) -> bool:
+    """Return whether an event contains a timestamp."""
+    # Check the timestamp against the complete-event interval.
+    return _event_start_us(event) <= timestamp_us <= _event_end_us(event)
+
+
+def _is_cpu_train_step_event(event: dict, step: int) -> bool:
+    """Return whether this event is the CPU train-step window."""
+    # Match the explicit step range added by ProfiledAsyncTrainer.
+    return (
+        event.get("ph") == "X"
+        and _event_category(event) == "user_annotation"
+        and _event_name(event) == f"train_step_{step}"
+    )
+
+
+def _is_cpu_nccl_all_reduce_event(event: dict) -> bool:
+    """Return whether this event is a CPU NCCL all-reduce annotation."""
+    # CPU NCCL annotations carry the external id used by the GPU event.
+    return (
+        event.get("ph") == "X"
+        and _event_category(event) == "user_annotation"
+        and _event_name(event) == "nccl:all_reduce"
+    )
+
+
+def _is_gpu_nccl_all_reduce_event(event: dict) -> bool:
+    """Return whether this event is a GPU NCCL all-reduce annotation."""
+    # GPU NCCL annotation duration is the P2P communication time we report.
+    return (
+        event.get("ph") == "X"
+        and _event_category(event) == "gpu_user_annotation"
+        and _event_name(event) == "nccl:all_reduce"
+    )
+
+
+def _build_p2p_comm_summaries(trace_path: Path, step_t: int) -> list[P2PCommSummary]:
+    """Build per-step GPU NCCL all-reduce timing summaries."""
+    # Load the chrome trace and select the same step window as the timeline.
+    events = _load_trace_events(trace_path)
+    steps = [step_t - 1, step_t, step_t + 1]
+    step_events = {
+        step: next(event for event in events if _is_cpu_train_step_event(event, step))
+        for step in steps
+    }
+
+    # Map CPU NCCL launch annotations to their owning train step.
+    external_ids_by_step = {step: set() for step in steps}
+    for event in events:
+        if not _is_cpu_nccl_all_reduce_event(event):
+            continue
+
+        # Assign the CPU launch to the train-step range that contains it.
+        start_us = _event_start_us(event)
+        for step, step_event in step_events.items():
+            if _contains_time_us(step_event, start_us):
+                external_id = _event_external_id(event)
+                assert external_id is not None
+                external_ids_by_step[step].add(external_id)
+
+    # Sum matching GPU NCCL annotation durations.
+    summaries = []
+    gpu_events = [event for event in events if _is_gpu_nccl_all_reduce_event(event)]
+    for step in steps:
+        durations_ms = [
+            float(event.get("dur", 0.0)) / 1000.0
+            for event in gpu_events
+            if _event_external_id(event) in external_ids_by_step[step]
+        ]
+        summaries.append(
+            P2PCommSummary(
+                step=step,
+                count=len(durations_ms),
+                total_ms=sum(durations_ms),
+                max_ms=max(durations_ms) if durations_ms else 0.0,
+            )
+        )
+    return summaries
 
 
 def _overlap_ms(left: TimelineSpan, right: TimelineSpan) -> float:
@@ -349,7 +516,12 @@ def _build_overlap_rows(spans: list[TimelineSpan], step_t: int) -> list[tuple[st
     return rows
 
 
-def _plot_timeline(spans: list[TimelineSpan], output_path: Path, step_t: int):
+def _plot_timeline(
+    spans: list[TimelineSpan],
+    p2p_comm_summaries: list[P2PCommSummary],
+    output_path: Path,
+    step_t: int,
+):
     """Plot async timeline spans as horizontal lines."""
     # Sort rows by step and pipeline order.
     order = {
@@ -364,7 +536,11 @@ def _plot_timeline(spans: list[TimelineSpan], output_path: Path, step_t: int):
 
     # Draw one horizontal interval per async part.
     fig_height = max(4.0, 0.38 * len(sorted_spans))
-    fig, ax = plt.subplots(figsize=(13, fig_height))
+    fig, (ax_timeline, ax_p2p) = plt.subplots(
+        nrows=2,
+        figsize=(13, fig_height + 2.6),
+        gridspec_kw={"height_ratios": [fig_height, 2.2]},
+    )
     colors = {
         "h2d_stream": "#1f77b4",
         "model_stream": "#2ca02c",
@@ -374,20 +550,35 @@ def _plot_timeline(spans: list[TimelineSpan], output_path: Path, step_t: int):
     labels = []
     for row_idx, span in enumerate(sorted_spans):
         color = colors[span.lane]
-        ax.hlines(row_idx, span.start_ms, span.end_ms, color=color, linewidth=5)
-        ax.scatter([span.start_ms, span.end_ms], [row_idx, row_idx], color=color, s=12)
+        ax_timeline.hlines(row_idx, span.start_ms, span.end_ms, color=color, linewidth=5)
+        ax_timeline.scatter([span.start_ms, span.end_ms], [row_idx, row_idx], color=color, s=12)
         labels.append(f"step {span.step} {span.part} ({span.lane})")
 
     # Format the timeline for quick visual inspection.
     min_ms = min(span.start_ms for span in sorted_spans)
     max_ms = max(span.end_ms for span in sorted_spans)
     pad_ms = max(0.5, (max_ms - min_ms) * 0.05)
-    ax.set_xlim(min_ms - pad_ms, max_ms + pad_ms)
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels)
-    ax.set_xlabel("milliseconds from profile origin")
-    ax.set_title(f"AsyncTrainer timeline around step T={step_t}")
-    ax.grid(axis="x", alpha=0.25)
+    ax_timeline.set_xlim(min_ms - pad_ms, max_ms + pad_ms)
+    ax_timeline.set_yticks(range(len(labels)))
+    ax_timeline.set_yticklabels(labels)
+    ax_timeline.set_xlabel("milliseconds from profile origin")
+    ax_timeline.set_title(f"AsyncTrainer DDP timeline around step T={step_t}")
+    ax_timeline.grid(axis="x", alpha=0.25)
+
+    # Plot GPU-side NCCL all-reduce time by train step.
+    p2p_steps = [summary.step for summary in p2p_comm_summaries]
+    ax_p2p.bar(
+        p2p_steps,
+        [summary.total_ms for summary in p2p_comm_summaries],
+        color="#17becf",
+        label="gpu nccl all_reduce",
+    )
+    ax_p2p.set_xticks(p2p_steps)
+    ax_p2p.set_xlabel("step")
+    ax_p2p.set_ylabel("duration_ms")
+    ax_p2p.set_title("P2P communication time from GPU NCCL all-reduce events")
+    ax_p2p.grid(axis="y", alpha=0.25)
+    ax_p2p.legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -398,6 +589,7 @@ def _write_report(
     trace_path: Path,
     plot_path: Path,
     spans: list[TimelineSpan],
+    p2p_comm_summaries: list[P2PCommSummary],
     trace_counts: dict[str, int],
     overlap_rows: list[tuple[str, float]],
 ):
@@ -432,6 +624,22 @@ def _write_report(
             f"{span.start_ms:.3f} | {span.end_ms:.3f} | {span.duration_ms:.3f} |"
         )
 
+    # Add GPU-side DDP communication timing.
+    lines.extend([
+        "",
+        "## P2P communication 时间",
+        "",
+        "这里统计 GPU-side `nccl:all_reduce` event duration; CPU `c10d::allreduce_` 只代表 launch 开销。",
+        "",
+        "| step | nccl_all_reduce_count | p2p_comm_ms | max_single_all_reduce_ms |",
+        "| --- | ---: | ---: | ---: |",
+    ])
+    for summary in p2p_comm_summaries:
+        lines.append(
+            f"| {summary.step} | {summary.count} | "
+            f"{summary.total_ms:.3f} | {summary.max_ms:.3f} |"
+        )
+
     # Add overlap and trace summaries.
     lines.extend([
         "",
@@ -460,57 +668,86 @@ def _write_report(
 
 
 def test_async_trainer_trace_report():
-    """Generate trace, timeline plot, and report for async training."""
+    """Launch DDP async profiling and generate rank-local reports."""
+    # Launch the DDP profiling body under torchrun from the parent process.
+    if "RANK" not in os.environ:
+        if torch.cuda.device_count() < PROFILE_WORLD_SIZE:
+            pytest.skip("requires at least two CUDA devices")
+        subprocess.run([
+            "torchrun",
+            "--standalone",
+            f"--nproc_per_node={PROFILE_WORLD_SIZE}",
+            "--module",
+            "pytest",
+            "-q",
+            "-s",
+            f"{__file__}::test_async_trainer_trace_report",
+        ], check=True)
+        return
+
     # Prepare output paths under ignored runs/.
+    rank = int(os.environ["RANK"])
     PROFILE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    trace_path = PROFILE_OUTPUT_DIR / "async_training_trace.json"
-    plot_path = PROFILE_OUTPUT_DIR / f"async_timeline_step_{PROFILE_STEP_T}.png"
-    report_path = PROFILE_OUTPUT_DIR / f"async_timeline_step_{PROFILE_STEP_T}.md"
-    for output_path in [trace_path, plot_path, report_path]:
+    profile_dir = PROFILE_OUTPUT_DIR / f"rank_{rank}_myprofiler"
+    plot_path = PROFILE_OUTPUT_DIR / f"async_timeline_step_{PROFILE_STEP_T}_rank{rank}.png"
+    report_path = PROFILE_OUTPUT_DIR / f"async_timeline_step_{PROFILE_STEP_T}_rank{rank}.md"
+    shutil.rmtree(profile_dir, ignore_errors=True)
+    for output_path in [plot_path, report_path]:
         output_path.unlink(missing_ok=True)
 
-    # Build the instrumented async trainer.
+    # Build the instrumented DDP async trainer.
     recorder = AsyncTimelineRecorder()
-    trainer = _make_trainer(recorder)
+    trainer = _make_trainer(recorder, profile_dir)
 
-    # Run profiler and export a chrome trace.
-    activities = [
-        torch.profiler.ProfilerActivity.CPU,
-        torch.profiler.ProfilerActivity.CUDA,
-    ]
+    # Run MyProfiler through the trainer's normal profiler lifecycle.
     AsyncProfilingHelper.enable(recorder.mark)
     try:
-        with torch.profiler.profile(
-            activities=activities,
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=False,
-            with_flops=False,
-            with_modules=False,
-        ) as profiler:
-            recorder.start()
-            trainer.run(n_iter=PROFILE_N_ITER, use_tqdm=False)
-            torch.cuda.synchronize()
+        recorder.start()
+        trainer.run(n_iter=PROFILE_N_ITER, use_tqdm=False)
+        torch.cuda.synchronize()
     finally:
         AsyncProfilingHelper.disable()
-    profiler.export_chrome_trace(str(trace_path))
+
+    # Resolve the chrome trace emitted by MyProfiler.
+    trace_path = _find_myprofiler_trace_path(profile_dir)
 
     # Analyze markers and trace into local artifacts.
     marks = recorder.resolve()
     spans = _build_timeline_spans(marks, PROFILE_STEP_T)
+    p2p_comm_summaries = _build_p2p_comm_summaries(trace_path, PROFILE_STEP_T)
     trace_counts = _trace_event_summary(trace_path, PROFILE_STEP_T)
     overlap_rows = _build_overlap_rows(spans, PROFILE_STEP_T)
-    _plot_timeline(spans, plot_path, PROFILE_STEP_T)
-    _write_report(report_path, trace_path, plot_path, spans, trace_counts, overlap_rows)
+    _plot_timeline(spans, p2p_comm_summaries, plot_path, PROFILE_STEP_T)
+    _write_report(
+        report_path,
+        trace_path,
+        plot_path,
+        spans,
+        p2p_comm_summaries,
+        trace_counts,
+        overlap_rows,
+    )
 
     # Assert artifacts and expected trace markers exist.
     assert trace_path.exists()
     assert plot_path.exists()
     assert report_path.exists()
     assert len(spans) == 18
+    assert len(p2p_comm_summaries) == 3
+    assert all(summary.count > 0 for summary in p2p_comm_summaries)
+    assert all(summary.total_ms > 0.0 for summary in p2p_comm_summaries)
     assert all(span.duration_ms >= 0.0 for span in spans)
     assert trace_counts["total_trace_events"] > 0
-    print(f"saved async png to: {plot_path}")
+    for summary in p2p_comm_summaries:
+        print(
+            f"rank {rank} step {summary.step}: "
+            f"p2p_comm={summary.total_ms:.3f} ms, "
+            f"all_reduce_count={summary.count}, max={summary.max_ms:.3f} ms"
+        )
+    print(f"rank {rank} saved async png to: {plot_path}")
+
+    # Release the DDP process group after all rank-local artifacts are written.
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

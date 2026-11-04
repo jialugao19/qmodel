@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import gc
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Callable, Protocol, Iterable, TypeAlias
 import time
@@ -15,6 +16,27 @@ Event: TypeAlias = torch.cuda.Event | torch._C._CudaEventBase
 Stream: TypeAlias = torch.cuda.Stream | torch._C._CudaStreamBase
 
 
+def _release_cuda_graph_state(owner):
+    """Release captured CUDA graph resources before distributed teardown."""
+    # Skip release when this run never captured a graph.
+    if owner._g is None:
+        return
+
+    # Synchronize ranks before dropping NCCL graph references.
+    owner.distributed.barrier()
+    torch.cuda.synchronize(owner.device)
+
+    # Drop graph-owned tensors and force Python to run the graph destructor.
+    owner._g = None
+    owner._static_inputs = None
+    owner._static_outputs = None
+    gc.collect()
+
+    # Ensure graph destruction is visible before process group teardown.
+    torch.cuda.synchronize(owner.device)
+    owner.distributed.barrier()
+
+
 class _AsyncBase:
     device: torch.device
     move_target: bool
@@ -24,7 +46,6 @@ class _AsyncBase:
     profiler: MyProfiler
     amp_scaler: MyScaler
     distributed: DistributedContext
-    manual_gradient_sync: bool
     async_profiling: AsyncProfilingHelper
     valid: bool
 
@@ -45,7 +66,6 @@ class _AsyncBase:
         self.dataloader = dataloader
         self.it = iter(dataloader)
         self.distributed = distributed if distributed is not None else DistributedContext.single(self.device)
-        self.manual_gradient_sync = False
         self.amp_scaler = amp_scaler
 
         # Create CPU executors and CUDA streams.
@@ -165,6 +185,7 @@ class _AsyncBase:
         self.profiler.stop()
         self.ex.shutdown(wait=True)
         self.ex2.shutdown(wait=True)
+        _release_cuda_graph_state(self)
 
         return res
 
@@ -190,7 +211,6 @@ class _SyncBase:
     profiler: MyProfiler
     amp_scaler: MyScaler
     distributed: DistributedContext
-    manual_gradient_sync: bool
     valid: bool
 
     def __init__(
@@ -206,7 +226,6 @@ class _SyncBase:
         self.graph_model = model
         self.dataloader = dataloader
         self.distributed = distributed if distributed is not None else DistributedContext.single(self.device)
-        self.manual_gradient_sync = False
         self.amp_scaler = amp_scaler
         self.model_stream: Stream = torch.cuda.Stream(device=self.device)
 
@@ -264,6 +283,7 @@ class _SyncBase:
 
         torch.cuda.synchronize(self.device)
         self.profiler.stop()
+        _release_cuda_graph_state(self)
 
         return res
 
@@ -293,7 +313,6 @@ class TrainProto(Protocol):
     lr_sched: Scheduler
     amp_scaler: MyScaler
     distributed: DistributedContext
-    manual_gradient_sync: bool
 
     num_normal_steps: int
 
@@ -363,6 +382,8 @@ class InferenceMixin:
 
 class TrainMixin:
     def _init(self: TrainProto):
+        """Initialize train graph state."""
+        # Put the model in training mode and clear graph state.
         self.model.train()
         self._g = None
         self._static_inputs = None
@@ -386,8 +407,6 @@ class TrainMixin:
             loss = self.loss_fn(output, target.to(dtype=output.dtype))
 
         self.amp_scaler.scale(loss).backward()
-        if self.manual_gradient_sync:
-            self.distributed.average_gradients(self.graph_model.parameters())
         self.amp_scaler.step(self.optimizer)
         self.amp_scaler.update()
 
@@ -402,40 +421,12 @@ class TrainMixin:
             v = self._normal_step(data, target, other_meta, curr_it)
             return v
 
-        # Use a manual gradient-reduction graph path for DDP.
-        if self.distributed.enabled:
-            return self._distributed_graph_step(data, target, curr_it)
-
-        # Capture the steady-state training graph once.
+        # Capture the steady-state full train iteration once.
         if self._g is None:
-            self._g = torch.cuda.CUDAGraph()
-            self._static_inputs = (data.clone(), target.to(dtype=data.dtype).clone())
-            self._static_outputs = torch.empty(1, device=self.device)
-            self.distributed.barrier()
-            torch.cuda.synchronize(self.device)
-
-            # copy data to static input
-            self.optimizer.zero_grad(set_to_none=True)
-
-            # it looks like everything is not updated but only recorded,
-            # so we have to replay once
-            with torch.cuda.stream(self.model_stream):  # type: ignore
-                with torch.cuda.graph(self._g, stream=self.model_stream, capture_error_mode="relaxed"):
-                    with self.amp_scaler.autocast():
-                        output = self.model(self._static_inputs[0])
-                        loss = self.loss_fn(output, self._static_inputs[1])
-
-                    self.amp_scaler.scale(loss).backward()
-                    self._static_outputs.copy_(loss.detach())
-                self.amp_scaler.step(self.optimizer)
-                self.amp_scaler.update()
-                self.lr_sched.step()
-
-            torch.cuda.synchronize(self.device)
-            self.distributed.barrier()
+            self._capture_train_graph(data, target)
 
         else:
-            # Replay the captured graph with new static inputs.
+            # Replay the captured graph with new static input values.
             assert self._static_inputs is not None
             assert self._static_outputs is not None
 
@@ -444,56 +435,45 @@ class TrainMixin:
                 return self._normal_step(data, target, other_meta, curr_it)
 
             self._static_inputs[0].copy_(data)
-            self._static_inputs[1].copy_(target.to(dtype=data.dtype))
-            # self._static_inputs[1].copy_(target)
+            self._static_inputs[1].copy_(target)
 
         self._g.replay()
 
-        # Return the global report loss.
-        return self._report_loss(self._static_outputs)
+        # Return the graph-captured global report loss.
+        assert self._static_outputs is not None
+        return self._static_outputs.detach()
 
-    def _distributed_graph_step(self: TrainProto, data: torch.Tensor, target: torch.Tensor, curr_it: int) -> torch.Tensor:
-        """Run one DDP CUDA graph train step."""
-        # Capture forward/backward without DDP reducer collectives.
-        if self._g is None:
-            self._g = torch.cuda.CUDAGraph()
-            self._static_inputs = (data.clone(), target.to(dtype=data.dtype).clone())
-            self._static_outputs = torch.empty(1, device=self.device)
-            self.distributed.barrier()
-            torch.cuda.synchronize(self.device)
-            self.optimizer.zero_grad(set_to_none=True)
+    def _capture_train_graph(self: TrainProto, data: torch.Tensor, target: torch.Tensor):
+        """Capture one full train iteration into a single CUDA graph."""
+        # Allocate stable graph input and output buffers.
+        self._g = torch.cuda.CUDAGraph()
+        self._static_inputs = (data.clone(), target.clone())
+        self._static_outputs = torch.empty(1, device=self.device)
 
-            with torch.cuda.stream(self.model_stream):  # type: ignore
-                with torch.cuda.graph(self._g, stream=self.model_stream, capture_error_mode="relaxed"):
-                    with self.amp_scaler.autocast():
-                        output = self.graph_model(self._static_inputs[0])
-                        loss = self.loss_fn(output, self._static_inputs[1])
+        # Drain outstanding CUDA work before DDP/NCCL graph capture.
+        self.distributed.barrier()
+        torch.cuda.synchronize(self.device)
+        self.optimizer.zero_grad(set_to_none=True)
 
-                    self.amp_scaler.scale(loss).backward()
-                    self._static_outputs.copy_(loss.detach())
+        # Capture forward, loss, DDP backward, and optimizer updates.
+        with torch.cuda.stream(self.model_stream):  # type: ignore
+            with torch.cuda.graph(self._g, stream=self.model_stream, capture_error_mode="relaxed"):
+                with self.amp_scaler.autocast():
+                    output = self.model(self._static_inputs[0])
+                    loss = self.loss_fn(output, self._static_inputs[1].to(dtype=output.dtype))
 
-            torch.cuda.synchronize(self.device)
-            self.distributed.barrier()
+                self.amp_scaler.scale(loss).backward()
+                self._static_outputs.copy_(loss.detach().reshape(1))
+                if self.distributed.enabled:
+                    torch.distributed.all_reduce(self._static_outputs, op=torch.distributed.ReduceOp.SUM)
+                    self._static_outputs.div_(self.distributed.world_size)
+                self.amp_scaler.step(self.optimizer)
+                self.amp_scaler.update()
+                self.lr_sched.step()
 
-        else:
-            # Update static input buffers for graph replay.
-            assert self._static_inputs is not None
-            assert self._static_outputs is not None
-
-            if self._static_inputs[0].shape[0] != data.shape[0]:
-                return self._normal_step(data, target, None, curr_it)
-
-            self._static_inputs[0].copy_(data)
-            self._static_inputs[1].copy_(target.to(dtype=data.dtype))
-
-        # Replay the local compute graph and apply synchronized optimizer state.
-        self.optimizer.zero_grad(set_to_none=False)
-        self._g.replay()
-        self.distributed.average_gradients(self.graph_model.parameters())
-        self.amp_scaler.step(self.optimizer)
-        self.amp_scaler.update()
-        self.lr_sched.step()
-        return self._report_loss(self._static_outputs)
+        # Ensure all ranks finish capture before replay starts.
+        torch.cuda.synchronize(self.device)
+        self.distributed.barrier()
 
 
     def _pre_step(self, curr_it):

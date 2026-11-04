@@ -29,6 +29,7 @@ class Trainer(AsyncTrainer):
         self.config = config
         self.distributed = DistributedContext.from_config(config)
         self.config.device = self.distributed.device
+        self.ddp_graph_stream: torch.cuda.Stream | None = None
 
         # Build model, optimizer, scheduler, scaler, and profiler.
         device = self.distributed.device
@@ -40,19 +41,15 @@ class Trainer(AsyncTrainer):
         lr_sched  = custom_scheduler(optimizer, config)
         amp_scaler  = MyScaler(config.use_amp, config.amp_dtype)
 
-        # Use manual gradient sync for DDP CUDA graph training.
-        manual_gradient_sync = self.distributed.enabled and config.train_use_cuda_graph
-        if manual_gradient_sync:
-            self.distributed.broadcast_module(raw_model)
+        # Validate graph-only component choices before capture.
+        if config.train_use_cuda_graph:
+            assert config.use_lr_sched == "custom"
+            assert config.use_amp in ["custom", "none"]
 
-        # Wrap the model in DDP for eager distributed training.
+        # Wrap distributed training with the DDP reducer in every mode.
         model: nn.Module = raw_model
-        if self.distributed.enabled and not manual_gradient_sync:
-            model = DistributedDataParallel(
-                raw_model,
-                device_ids=[self.distributed.local_rank],
-                output_device=self.distributed.local_rank,
-            )
+        if self.distributed.enabled:
+            model = self._wrap_distributed_model(raw_model)
 
         # Build the profiler and rank-local dataloader.
         do_profile  = config.profiler.profile_section == "train"
@@ -74,10 +71,14 @@ class Trainer(AsyncTrainer):
             distributed=self.distributed,
         )
 
+        # Reuse the DDP construction stream for graph warmup and capture.
+        if config.train_use_cuda_graph:
+            assert self.ddp_graph_stream is not None
+            self.model_stream = self.ddp_graph_stream
+
         # Store raw model and evaluator for checkpoint/eval paths.
         self.raw_model = raw_model
         self.graph_model = raw_model
-        self.manual_gradient_sync = manual_gradient_sync
         self.evaluator = Evaluator(config, group="test", distributed=self.distributed)
 
         # Create persistent writers on rank zero.
@@ -91,6 +92,30 @@ class Trainer(AsyncTrainer):
         self.start_iter = 0
 
         self.load_from_checkpoint()
+
+    def _wrap_distributed_model(self, raw_model: nn.Module) -> DistributedDataParallel:
+        """Wrap the raw model with DDP using graph-safe construction."""
+        # Construct graph-captured DDP on a side stream as required by PyTorch.
+        if self.config.train_use_cuda_graph:
+            stream = torch.cuda.Stream(device=self.distributed.device)
+            self.ddp_graph_stream = stream
+            stream.wait_stream(torch.cuda.current_stream(self.distributed.device))
+            with torch.cuda.stream(stream):
+                model = DistributedDataParallel(
+                    raw_model,
+                    device_ids=[self.distributed.local_rank],
+                    output_device=self.distributed.local_rank,
+                    static_graph=True,
+                )
+            torch.cuda.current_stream(self.distributed.device).wait_stream(stream)
+            return model
+
+        # Construct normal eager DDP on the current stream.
+        return DistributedDataParallel(
+            raw_model,
+            device_ids=[self.distributed.local_rank],
+            output_device=self.distributed.local_rank,
+        )
 
     def load_from_checkpoint(self):
         if self.config.load_from_iter is None:
