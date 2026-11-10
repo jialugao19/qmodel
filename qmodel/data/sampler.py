@@ -48,7 +48,7 @@ class CustomSampler(Sampler):
         self.not_yet_started = False
 
         # Iterate the first epoch from the requested global sample offset.
-        start = self.start
+        start = self.start % (len(self.dataset) // self.global_batch_size * self.global_batch_size) if self.drop_last else self.start
         while True:
             yield from self._iter_epoch(start)
             if not self.infinite:
@@ -89,3 +89,19 @@ class CustomSampler(Sampler):
             local_end = min(local_start + self.local_batch_size, remainder)
             count += max(0, local_end - local_start)
         return count
+
+    def state_dict(self, consumed_batches):
+        # Record consumed positions independently of loader prefetch.
+        return {
+            "seed": self.seed, "shuffle": self.shuffle,
+            "size": len(self.dataset), "global_batch_size": self.global_batch_size,
+            "world_size": self.world_size, "consumed_batches": consumed_batches,
+        }
+
+    def load_state_dict(self, state):
+        # Require unchanged ordering and distributed geometry.
+        for key in ("seed", "shuffle", "size", "global_batch_size", "world_size"):
+            actual = len(self.dataset) if key == "size" else getattr(self, key)
+            if actual != state[key]:
+                raise ValueError(f"Sampler mismatch: {key}")
+        self.set_start_iter(state["consumed_batches"] * self.global_batch_size)

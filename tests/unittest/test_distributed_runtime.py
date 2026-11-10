@@ -317,16 +317,17 @@ def _run_ddp_checkpoint_full():
 
 def _run_ddp_checkpoint_first_segment():
     """Train until the resume checkpoint is written."""
-    # Enter pre_step(CHECKPOINT_RESUME_ITER) so Trainer writes iter_2.pt.
+    # Keep the full budget in config while interrupting at a completed boundary.
     torch.manual_seed(123)
     config = _make_checkpoint_config(
         root_dir=CHECKPOINT_SPLIT_ROOT,
-        num_iters=CHECKPOINT_RESUME_ITER + 1,
+        num_iters=CHECKPOINT_NUM_ITERS,
         load_from_iter=None,
         save_every=CHECKPOINT_RESUME_ITER,
     )
     trainer = Trainer(config)
-    trainer.train()
+    trainer.run(n_iter=CHECKPOINT_RESUME_ITER, start=0, use_tqdm=False)
+    trainer.writer.close() if trainer.writer is not None else None
 
     # Ensure the checkpoint is visible before the next torchrun.
     trainer.distributed.barrier()
@@ -362,6 +363,7 @@ def _run_ddp_smoke(use_cuda_graph: bool, run_eval: bool):
     # Build and execute the trainer.
     torch.manual_seed(123)
     config = _make_config(use_cuda_graph)
+    config.save_every = config.num_iters
     trainer = Trainer(config)
     res = trainer.train()
 
@@ -369,16 +371,16 @@ def _run_ddp_smoke(use_cuda_graph: bool, run_eval: bool):
     trainer.distributed.barrier()
     if trainer.distributed.is_main:
         assert len(res) > 0
-        assert Path(config.root_dir, "ckpt", "iter_0.pt").exists()
+        assert Path(config.root_dir, "ckpt", f"iter_{config.num_iters}.pt").exists()
     else:
         assert len(res) == 0
 
     # Check distributed eval gather on the eager smoke path.
     if run_eval:
-        metrics = trainer.evaluator.eval_single(0, n_iter=2)
+        metrics = trainer.evaluator.eval_single(config.num_iters, n_iter=2)
         if trainer.distributed.is_main:
             assert "global IC" in metrics
-            assert Path(config.root_dir, "eval", "eval_0.feather").exists()
+            assert Path(config.root_dir, "eval", f"eval_{config.num_iters}.feather").exists()
 
     # Tear down this torchrun process group.
     torch.distributed.destroy_process_group()
@@ -438,6 +440,9 @@ def test_launch_ddp_smoke_eager():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires at least two CUDA devices")
 
+    # Remove only this test fixture before exercising fresh initialization.
+    shutil.rmtree(_make_config(False).root_dir, ignore_errors=True)
+
     # Run this file under torchrun with two ranks.
     subprocess.run([
         "torchrun",
@@ -455,6 +460,9 @@ def test_launch_ddp_smoke_cuda_graph():
     # Require two visible CUDA devices for the launch test.
     if torch.cuda.device_count() < 2:
         pytest.skip("requires at least two CUDA devices")
+
+    # Remove only this test fixture before exercising fresh initialization.
+    shutil.rmtree(_make_config(True).root_dir, ignore_errors=True)
 
     # Run this file under torchrun with two ranks.
     subprocess.run([

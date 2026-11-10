@@ -151,6 +151,8 @@ class GraphLRScheduler:
         }
 
     def load_state_dict(self, state):
+        # Rebind groups replaced by optimizer restoration.
+        self.param_groups = self.optimizer.param_groups
         self.global_step.copy_(state["global_step"].to(self.global_step.device))
         self.warmup_iters.copy_(state["warmup_iters"].to(self.warmup_iters.device))
         self.total_iters.copy_(state["total_iters"].to(self.total_iters.device))

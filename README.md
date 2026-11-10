@@ -101,11 +101,17 @@ GPU 正式训练前, 用代表性输入测量 batch 等待、H2D、计算和端�
 
 ## 6. 如何恢复和评价 checkpoint
 
-顶层 checkpoint 写入 `root_dir/ckpt/iter_<iteration>.pt`, 保存 model、optimizer、scheduler、scaler、iteration 和 config. 设置 `load_from_iter` 后, Trainer 从当前 `root_dir` 加载状态, 并按 `iteration * batch_size` 恢复 sampler 的 global sample 偏移. 实现见 [trainer.py](qmodel/core/trainer.py) 和 [checkpoint.py](qmodel/components/checkpoint.py).
+顶层 checkpoint 写入 `root_dir/ckpt/iter_<global_step>.pt`. `global_step` 是已完成的 optimizer 更新次数; Torch AMP 跳过更新时不增加计数, 已消费 batch 位置单独记录. `num_iters` 保持原有 batch 执行预算语义.
 
-恢复依赖一致的数据顺序、采样设置和模型配置. 当前 checkpoint 不保存 Python/NumPy/Torch RNG 全状态, 也不验证数据或代码 identity; 任意实验的 bit-exact 恢复需要消费者另行验证. 保存发生在对应 iteration 的训练 step 之前, 不自动保证退出时额外保存最终 checkpoint.
+设置 `trainer.signal = 1` 后, Trainer 在当前完整更新结束后保存, 成功后清零并继续训练. DDP 仅由 rank 0 设置该属性. `signal=0` 不触发额外保存. 原有 `save_every` 保留, 同一步多个保存请求合并. 保存先写同目录临时文件, fsync 后原子 rename; 写入失败直接报错, 不清零 signal.
 
-训练中评价会读取对应 iteration 的 checkpoint, 因此评价时刻必须已有该 checkpoint. 独立 `evaluate()` 遍历 `evaluator.eval_checkpoint_iter` 中大于 0 的值; `eval_all_num_iters=0` 表示读取完整评价 loader.
+启动时使用传入的 `root_dir` 查找已提交文件, 自动选择最大 `global_step` 的 Checkpoint, 从其 config 构建训练对象. 不需要恢复参数, `load_from_iter` 不再控制 Trainer 自动恢复. 无 Checkpoint 时按传入配置启动. 临时文件不参与选择, 已提交文件损坏或缺少必要字段直接报错, 不回退到旧文件.
+
+新格式保存 config、model、optimizer、scheduler、AMP、global_step、实际消费 batch 位置, 以及各 rank 的模型 buffers、Python/NumPy/Torch CPU/CUDA RNG 和 sampler 顺序参数. 恢复从下一 batch/更新继续, 不使用 DataLoader 预取推进的位置. 实现见 [trainer.py](qmodel/core/trainer.py) 和 [checkpoint.py](qmodel/components/checkpoint.py).
+
+精确续训要求相同代码、数据和分布式布局, Dataset 对相同 indices 返回相同 batch. 不覆盖 worker 内随机数据变换或外部数据状态. CUDA 非确定性算子和 DDP reduction 顺序仍可能产生浮点舍入差异. DDP + CUDA Graph 恢复后先执行计入进度的 eager warmup, 再重新 capture. 旧格式可加载时按其原有 step 前保存语义恢复, 明确提示缺少 RNG 状态, 不保证与连续训练轨迹一致.
+
+训练中评价在完整更新边界保存后读取相应 Checkpoint, 并恢复评价前的训练 RNG. 独立 `evaluate()` 继续使用 `evaluator.eval_checkpoint_iter`; `eval_all_num_iters=0` 表示完整评价 loader.
 
 顶层 `Evaluator` 有明确的金融数据格式: prediction 和 target 通常为 `(B, 1)`, metadata 为 `(B, 3)` 的 `code`, `date`, `time`. 它重建全局行顺序, 生成 `StockCode` / `DateTime`, 计算 global Pearson IC, 并写入 `root_dir/eval/eval_<iteration>.feather`. 日期与时间编码必须符合 [util.py](qmodel/util.py) 的转换规则, 不能直接假定支持任意日期表示.
 

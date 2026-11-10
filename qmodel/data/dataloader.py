@@ -48,7 +48,8 @@ def setup_train_dataloader(
         sampler=sampler,
         collate_fn=custom_collate_fn,
         num_workers=n_workers,
-        pin_memory=True
+        pin_memory=True,
+        generator=torch.Generator().manual_seed(config.seed),
     ), sampler
 
 
@@ -86,5 +87,6 @@ def setup_eval_dataloader(
         sampler=sampler,
         collate_fn=custom_collate_fn,
         num_workers=config.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        generator=torch.Generator().manual_seed(config.seed),
     )

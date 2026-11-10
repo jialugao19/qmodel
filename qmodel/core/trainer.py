@@ -10,7 +10,7 @@ from qmodel.core.eval_trainer import AsyncTrainer, SyncTrainer
 from qmodel.core.evaluator import Evaluator
 from qmodel.components.distributed import DistributedContext
 from qmodel.components.lr_scheduler import custom_scheduler
-from qmodel.components.checkpoint import CheckpointSaver
+from qmodel.components.checkpoint import CheckpointSaver, capture_rng, restore_rng
 from qmodel.components.amp_scaler import MyScaler
 from qmodel.components.profiler import MyProfiler
 from qmodel.data.dataloader import setup_train_dataloader
@@ -26,6 +26,12 @@ class Trainer(AsyncTrainer):
     def __init__(self, config: QConfig) -> None:
         """Build the training runtime from config."""
         # Initialize distributed placement before constructing CUDA modules.
+        restored = CheckpointSaver.latest(config.root_dir)
+        if restored is not None:
+            config = restored[2]["config"]
+        self.signal = 0
+        self.global_step = 0
+        self.consumed_batches = 0
         self.config = config
         self.distributed = DistributedContext.from_config(config)
         self.config.device = self.distributed.device
@@ -72,7 +78,7 @@ class Trainer(AsyncTrainer):
         )
 
         # Reuse the DDP construction stream for graph warmup and capture.
-        if config.train_use_cuda_graph:
+        if config.train_use_cuda_graph and self.distributed.enabled:
             assert self.ddp_graph_stream is not None
             self.model_stream = self.ddp_graph_stream
 
@@ -91,7 +97,7 @@ class Trainer(AsyncTrainer):
         self.sampler = sampler
         self.start_iter = 0
 
-        self.load_from_checkpoint()
+        self.load_from_checkpoint(restored)
 
     def _wrap_distributed_model(self, raw_model: nn.Module) -> DistributedDataParallel:
         """Wrap the raw model with DDP using graph-safe construction."""
@@ -117,22 +123,36 @@ class Trainer(AsyncTrainer):
             output_device=self.distributed.local_rank,
         )
 
-    def load_from_checkpoint(self):
-        if self.config.load_from_iter is None:
+    def load_from_checkpoint(self, restored=None):
+        # Restore objects before creating the loader iterator.
+        if restored is None:
             return
-        iteration: int = self.config.load_from_iter
-        path = Path(self.config.root_dir) / f"ckpt/iter_{iteration}.pt"
-
-        logger.info(f"load from iteration {iteration}")
+        _, path, state = restored
         self.checkpointer.load(
             path, self.raw_model, self.optimizer, self.lr_sched, self.amp_scaler
         )
-        self.sampler.set_start_iter(iteration * self.config.batch_size)
-        self.start_iter = iteration
+        self.global_step = state.get("global_step", state["iteration"])
+        if "progress" in state:
+            progress = state["progress"]
+            if len(progress["ranks"]) != self.distributed.world_size:
+                raise ValueError("Checkpoint world size differs from current runtime")
+            local = progress["ranks"][self.distributed.rank]
+            self.consumed_batches = local["sampler"]["consumed_batches"]
+            self.sampler.load_state_dict(local["sampler"])
+            self.raw_model.load_state_dict(local["model"])
+            restore_rng(local["rng"])
+        else:
+            logger.warning("Legacy checkpoint: RNG state is missing; exact continuation is not guaranteed")
+            self.consumed_batches = state["iteration"]
+            self.sampler.set_start_iter(self.consumed_batches * self.config.batch_size)
+        self.start_iter = self.consumed_batches
+        # Warm the new DDP reducer with real updates before recapturing NCCL.
+        if self.config.train_use_cuda_graph and self.distributed.enabled:
+            self.num_normal_steps += self.start_iter
         self.distributed.barrier()
 
     def train(self):
-        assert isinstance(self.dataloader, torch.utils.data.DataLoader)
+        # Keep the configured total batch budget across restarts.
         n_iter = min(len(self.dataloader), self.config.num_iters)
         res = self.run(n_iter=n_iter, start=self.start_iter, use_tqdm=False)
         if self.writer is not None:
@@ -140,30 +160,59 @@ class Trainer(AsyncTrainer):
         return res
 
     def _pre_step(self, curr_it):
-        if curr_it % self.config.save_every == 0:
-            # Finish async training work before materializing checkpoint tensors.
-            torch.cuda.synchronize(self.device)
-            if self.distributed.is_main:
+        # Saving and evaluation belong to the completed update boundary.
+        pass
+
+    def _completed_step(self, curr_it, post):
+        # Count consumed batches separately from successful optimizer updates.
+        self.consumed_batches = curr_it + 1
+        if self.update_completed:
+            self.global_step += 1
+        request = self.signal if self.distributed.is_main else 0
+        if self.distributed.enabled:
+            control = torch.tensor(request, device=self.device)
+            torch.distributed.broadcast(control, src=0)
+            request = control.item()
+        periodic = self.update_completed and self.global_step % self.config.save_every == 0
+        evaluate = self.update_completed and self.config.eval_during and self.global_step % self.config.eval_every == 0
+        if not self.update_completed or not (request or periodic or evaluate):
+            return
+
+        # Drain logging and GPU work before collecting the immutable boundary.
+        post.result()
+        torch.cuda.synchronize(self.device)
+        local = {
+            "rng": capture_rng(),
+            "sampler": self.sampler.state_dict(self.consumed_batches),
+            "model": {key: value.detach().cpu().clone() for key, value in self.raw_model.state_dict().items()},
+        }
+        ranks = self.distributed.gather_object(local)
+        error = None
+        if self.distributed.is_main:
+            try:
                 self.checkpointer.save(
                     self.raw_model, self.optimizer, self.lr_sched,
-                    self.amp_scaler, curr_it
+                    self.amp_scaler, self.global_step, {"ranks": ranks}
                 )
-            self.distributed.barrier()
+            except Exception as failure:
+                error = failure
+        if self.distributed.enabled:
+            status = [repr(error) if error is not None else None]
+            torch.distributed.broadcast_object_list(status, src=0)
+            if status[0] is not None and error is None:
+                raise RuntimeError(f"Rank zero checkpoint save failed: {status[0]}")
+        if error is not None:
+            raise error
+        if request and self.distributed.is_main:
+            self.signal = 0
 
-        if self.config.eval_during and \
-            curr_it % self.config.eval_every == 0:
-
-            torch.cuda.empty_cache()
-            metrics = self.evaluator.eval_partial(
-                curr_it, self.config.eval_during_num_iters
-            )
-            torch.cuda.empty_cache()
-
-            if self.distributed.is_main:
-                assert self.writer is not None
-                ret_col = self.config.ret_col_name
-                for k, v in metrics.items():
-                    self.writer.add_scalar(f'{ret_col}/{k}', v, curr_it)
+        # Evaluation must not perturb the subsequent training random sequence.
+        if evaluate:
+            metrics = self.evaluator.eval_partial(self.global_step, self.config.eval_during_num_iters)
+            restore_rng(local["rng"])
+            if self.writer is not None:
+                for key, value in metrics.items():
+                    self.writer.add_scalar(f"{self.config.ret_col_name}/{key}", value, self.global_step)
 
     def _post_step(self, res, buffer, target, other_meta, curr_it):
         """Log rank-zero train metrics after one train step."""

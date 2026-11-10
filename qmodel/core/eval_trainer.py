@@ -64,7 +64,7 @@ class _AsyncBase:
         self.model = model
         self.graph_model = model
         self.dataloader = dataloader
-        self.it = iter(dataloader)
+        self.it = None
         self.distributed = distributed if distributed is not None else DistributedContext.single(self.device)
         self.amp_scaler = amp_scaler
 
@@ -125,6 +125,7 @@ class _AsyncBase:
         self.profiler.start(sleep_sec=2)
         torch.cuda.synchronize(self.device)
 
+        self.it = iter(self.dataloader)
         res, gbuffer = [], None
         event2, event3 = torch.cuda.Event(), torch.cuda.Event()
         one_time_events = [torch.cuda.Event() for _ in range(3)]
@@ -178,7 +179,8 @@ class _AsyncBase:
             event4.synchronize()
             event4.record(self.stream2)
 
-            self.ex2.submit(self._post_step_async, res, buffer, target, other_meta, curr_it, event4)
+            post = self.ex2.submit(self._post_step_async, res, buffer, target, other_meta, curr_it, event4)
+            self._completed_step(curr_it, post)
             self.profiler.step()
 
         torch.cuda.synchronize(self.device)
@@ -188,6 +190,10 @@ class _AsyncBase:
         _release_cuda_graph_state(self)
 
         return res
+
+    def _completed_step(self, curr_it, post):
+        # Subclasses may commit state before another update is submitted.
+        pass
 
     def _post_step_async(self, res, buffer, target, other_meta, curr_it, event: Event):
         """(in sub-thread) ex2 will execute _post_step after event is recorded (i.e., buffer copy done)
@@ -407,10 +413,13 @@ class TrainMixin:
             loss = self.loss_fn(output, target.to(dtype=output.dtype))
 
         self.amp_scaler.scale(loss).backward()
+        scale = self.amp_scaler.get_scale() if isinstance(self.amp_scaler._scaler, torch.amp.GradScaler) else None
         self.amp_scaler.step(self.optimizer)
         self.amp_scaler.update()
+        self.update_completed = scale is None or self.amp_scaler.get_scale() >= scale
 
-        self.lr_sched.step()
+        if self.update_completed:
+            self.lr_sched.step()
 
         return self._report_loss(loss)
 
@@ -438,6 +447,7 @@ class TrainMixin:
             self._static_inputs[1].copy_(target)
 
         self._g.replay()
+        self.update_completed = True
 
         # Return the graph-captured global report loss.
         assert self._static_outputs is not None
