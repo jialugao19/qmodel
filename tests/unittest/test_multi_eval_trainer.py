@@ -128,7 +128,7 @@ def test_multi_gpu_eval_trainer_has_zero_error():
         model1, dataloader1, nn.MSELoss(), optim1, sched1, scaler1, profiler1, device1, 2000)
     trainer1._post_step = _post_step_train
     trainer1._pre_step = lambda curr_it: curr_it  # type: ignore
-    res1 = trainer1.run(n_iter=n_sample//bs)
+    res1 = trainer1.run(n_iter=n_sample//bs).statistics
 
     # Run async training on GPU1.
     dataloader2 = get_dataloader(n_sample, bs, dtype, seed)
@@ -136,7 +136,7 @@ def test_multi_gpu_eval_trainer_has_zero_error():
         model2, dataloader2, nn.MSELoss(), optim2, sched2, scaler2, profiler2, device2, 2000)
     trainer2._post_step = _post_step_train
     trainer2._pre_step = lambda curr_it: curr_it  # type: ignore
-    res2 = trainer2.run(n_iter=n_sample//bs)
+    res2 = trainer2.run(n_iter=n_sample//bs).statistics
 
     # Require zero drift in train losses and final parameters.
     train_loss1 = torch.utils.data.default_collate(res1)

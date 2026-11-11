@@ -1,5 +1,5 @@
 ---
-intention: 记录 qmodel 0.2.20 Checkpoint 的恢复语义、验证证据和已知限制.
+intention: 记录 qmodel Checkpoint 的恢复语义、验证证据和已知限制.
 ---
 
 # Checkpoint 验证
@@ -37,3 +37,18 @@ Trainer 在 optimizer 更新完成后保存, 避免后台 post-step 与下一次
 精确数据衔接要求 Dataset 对相同 indices 返回相同 batch, 以及相同代码、数据和 DDP 布局. 不恢复 worker 内随机变换或外部数据状态. DDP reduction 和 CUDA 非确定性运算可能引入浮点舍入差异; 不承诺任意模型 bit-exact. 旧格式缺少 RNG 状态, 只保证恢复可用状态, 不保证连续训练轨迹一致.
 
 构建前清理旧 build 产物, 防止相同时间戳的过期源码进入 wheel. 发布目标为 CPython 3.10 Linux x86_64 wheel, 不是通用 Python wheel.
+
+
+## 4. 0.2.21 暂停与项目验收
+
+新增接口为 TrainResult, get_project_state/load_project_state, save_pause_checkpoint, restore_training_state 和 close_training_resources. 不新增独立工具或服务; 持久化复用 CheckpointSaver, 测量复用 AsyncProfilingHelper 和 MyProfiler.
+
+暂停对照使用真实返回和进程退出, 不再使用 os._exit. 项目状态测试在子类初始化后创建独立 generator 和滚动窗口, 验证它们与内置 loss window 一并恢复. 完整格式标记升级为 2, 仍能读取旧格式.
+
+各项目应固定模型、Dataset、batch、精度和 GPU 布局, 配对比较 0.2.20 连续训练、0.2.21 连续训练和 0.2.21 恢复后的稳态. 测量期间禁用 profiling 的人为延迟, 使用相同数据区间, 分别记录 batch 等待、GPU 空档、重叠和有效 steps/s. 用基线重复测量的波动范围判断可测退化, 样本量不足或外部竞争明显时标记未确定. 加载、DDP warmup 和 Graph recapture 开销单独报告.
+
+相同负载的 MFU 相对变化使用有效吞吐比; 绝对 MFU 使用项目已有 FLOPs 和硬件峰值口径. qmodel 的框架测试不能代替真实项目 MFU 验收.
+
+框架 smoke 使用同一无人工延迟的小模型, 与 0.2.20 交替运行 5 对 16-step 测量. baseline: 中位数 42.29 steps/s, 范围 33.66-44.10. updated: 中位数 43.75 steps/s, 范围 38.28-45.70. 此短测量包含启动开销, 且 GPU 持续存在外部竞争; 观察到 CPU/GPU 重叠, 但稳态 MFU 无退化的结论仍为未确定, 需由项目真实负载验收.
+
+最终全量测试 134 项通过, 6 项为 torchrun 子进程入口而跳过; 另行追加的后台统计异常测试通过. wheel 安装后的多 worker/Torch AMP 暂停重启状态对照通过, 暂停返回时无存活 DataLoader 子进程, 训练子进程退出后其 PID 不再出现在 GPU 进程列表. wheel 中全部 Python 源码与工作区逐文件一致, twine metadata 检查通过.

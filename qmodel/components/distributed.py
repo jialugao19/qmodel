@@ -14,6 +14,7 @@ class DistributedContext:
     world_size: int
     local_rank: int
     device: torch.device
+    owns_process_group: bool = False
 
     @classmethod
     def from_config(cls, config: QConfig) -> "DistributedContext":
@@ -32,8 +33,10 @@ class DistributedContext:
         local_rank = int(os.environ["LOCAL_RANK"])
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
-        dist.init_process_group(backend=config.distributed.backend)
-        return cls(True, rank, world_size, local_rank, device)
+        owns_group = not dist.is_initialized()
+        if owns_group:
+            dist.init_process_group(backend=config.distributed.backend)
+        return cls(True, rank, world_size, local_rank, device, owns_group)
 
     @classmethod
     def single(cls, device: torch.device | str) -> "DistributedContext":

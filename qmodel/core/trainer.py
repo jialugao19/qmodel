@@ -21,6 +21,7 @@ from qmodel.config import QConfig
 
 from line_profiler import profile
 import time
+import pickle
 
 class Trainer(AsyncTrainer):
     def __init__(self, config: QConfig) -> None:
@@ -97,7 +98,7 @@ class Trainer(AsyncTrainer):
         self.sampler = sampler
         self.start_iter = 0
 
-        self.load_from_checkpoint(restored)
+        self.pending_restore = restored
 
     def _wrap_distributed_model(self, raw_model: nn.Module) -> DistributedDataParallel:
         """Wrap the raw model with DDP using graph-safe construction."""
@@ -123,6 +124,11 @@ class Trainer(AsyncTrainer):
             output_device=self.distributed.local_rank,
         )
 
+    def restore_training_state(self):
+        # Delay project restoration until subclass initialization is complete.
+        self.load_from_checkpoint(self.pending_restore)
+        self.pending_restore = None
+
     def load_from_checkpoint(self, restored=None):
         # Restore objects before creating the loader iterator.
         if restored is None:
@@ -140,6 +146,11 @@ class Trainer(AsyncTrainer):
             self.consumed_batches = local["sampler"]["consumed_batches"]
             self.sampler.load_state_dict(local["sampler"])
             self.raw_model.load_state_dict(local["model"])
+            if state.get("format_version") == 2:
+                self.statistics = local["statistics"]
+                self.load_project_state(local["project"])
+            else:
+                logger.warning("Legacy checkpoint: statistics and project state are missing")
             restore_rng(local["rng"])
         else:
             logger.warning("Legacy checkpoint: RNG state is missing; exact continuation is not guaranteed")
@@ -155,9 +166,16 @@ class Trainer(AsyncTrainer):
         # Keep the configured total batch budget across restarts.
         n_iter = min(len(self.dataloader), self.config.num_iters)
         res = self.run(n_iter=n_iter, start=self.start_iter, use_tqdm=False)
-        if self.writer is not None:
-            self.writer.close()
         return res
+
+    def close_training_resources(self):
+        # Close persistent logging before returning a pause result.
+        try:
+            if self.writer is not None:
+                self.writer.close()
+        finally:
+            if (self.pause_requested or self.run_failed) and self.distributed.owns_process_group:
+                torch.distributed.destroy_process_group()
 
     def _pre_step(self, curr_it):
         # Saving and evaluation belong to the completed update boundary.
@@ -179,18 +197,35 @@ class Trainer(AsyncTrainer):
             return
 
         # Drain logging and GPU work before collecting the immutable boundary.
-        post.result()
-        torch.cuda.synchronize(self.device)
-        local = {
-            "rng": capture_rng(),
-            "sampler": self.sampler.state_dict(self.consumed_batches),
-            "model": {key: value.detach().cpu().clone() for key, value in self.raw_model.state_dict().items()},
-        }
+        export_error = None
+        try:
+            if post is not None:
+                post.result()
+                self._check_completed_posts()
+            torch.cuda.synchronize(self.device)
+            local = {
+                "project": self.get_project_state(),
+                "statistics": list(self.statistics),
+                "rng": capture_rng(),
+                "sampler": self.sampler.state_dict(self.consumed_batches),
+                "model": {key: value.detach().cpu().clone() for key, value in self.raw_model.state_dict().items()},
+            }
+            if self.distributed.enabled:
+                pickle.dumps(local)
+        except Exception as failure:
+            export_error = failure
+        if self.distributed.enabled:
+            errors = [None] * self.distributed.world_size
+            torch.distributed.all_gather_object(errors, repr(export_error) if export_error else None)
+            if any(error is not None for error in errors) and export_error is None:
+                raise RuntimeError(f"Checkpoint state export failed: {errors}")
+        if export_error is not None:
+            raise export_error
         ranks = self.distributed.gather_object(local)
         error = None
         if self.distributed.is_main:
             try:
-                self.checkpointer.save(
+                self.checkpoint_path = self.checkpointer.save(
                     self.raw_model, self.optimizer, self.lr_sched,
                     self.amp_scaler, self.global_step, {"ranks": ranks}
                 )
@@ -203,8 +238,13 @@ class Trainer(AsyncTrainer):
                 raise RuntimeError(f"Rank zero checkpoint save failed: {status[0]}")
         if error is not None:
             raise error
-        if request and self.distributed.is_main:
-            self.signal = 0
+        paths = [self.checkpoint_path]
+        if self.distributed.enabled:
+            torch.distributed.broadcast_object_list(paths, src=0)
+        self.checkpoint_path = paths[0]
+        if request:
+            self.pause_requested = True
+            return True
 
         # Evaluation must not perturb the subsequent training random sequence.
         if evaluate:

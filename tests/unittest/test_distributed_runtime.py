@@ -365,7 +365,7 @@ def _run_ddp_smoke(use_cuda_graph: bool, run_eval: bool):
     config = _make_config(use_cuda_graph)
     config.save_every = config.num_iters
     trainer = Trainer(config)
-    res = trainer.train()
+    res = trainer.train().statistics
 
     # Check rank-zero training outputs.
     trainer.distributed.barrier()

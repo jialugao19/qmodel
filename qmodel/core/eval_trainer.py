@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
 import gc
+import sys
+from contextlib import ExitStack
+from collections import deque
+from dataclasses import dataclass
+from typing import Literal
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Callable, Protocol, Iterable, TypeAlias
 import time
@@ -23,7 +28,8 @@ def _release_cuda_graph_state(owner):
         return
 
     # Synchronize ranks before dropping NCCL graph references.
-    owner.distributed.barrier()
+    if sys.exc_info()[0] is None:
+        owner.distributed.barrier()
     torch.cuda.synchronize(owner.device)
 
     # Drop graph-owned tensors and force Python to run the graph destructor.
@@ -34,7 +40,17 @@ def _release_cuda_graph_state(owner):
 
     # Ensure graph destruction is visible before process group teardown.
     torch.cuda.synchronize(owner.device)
-    owner.distributed.barrier()
+    if sys.exc_info()[0] is None:
+        owner.distributed.barrier()
+
+
+@dataclass
+class TrainResult:
+    status: Literal["completed", "paused"]
+    global_step: int
+    consumed_batches: int
+    checkpoint_path: str | None
+    statistics: list
 
 
 class _AsyncBase:
@@ -69,6 +85,7 @@ class _AsyncBase:
         self.amp_scaler = amp_scaler
 
         # Create CPU executors and CUDA streams.
+        self.pending_posts = deque()
         self.ex = ThreadPoolExecutor(max_workers=1)
         self.ex2 = ThreadPoolExecutor(max_workers=1)
         self.stream1: Stream = torch.cuda.Stream(device=self.device)   # host->device
@@ -78,6 +95,12 @@ class _AsyncBase:
         self.profiler = profiler
         self.async_profiling = AsyncProfilingHelper()
         self.valid = True
+        self.signal = 0
+        self.global_step = 0
+        self.consumed_batches = 0
+        self.statistics = []
+        self.pause_requested = False
+        self.checkpoint_path = None
 
         assert num_normal_steps >= 12
         self.num_normal_steps = num_normal_steps
@@ -122,74 +145,92 @@ class _AsyncBase:
         self.valid = False
         self._init()
 
-        self.profiler.start(sleep_sec=2)
-        torch.cuda.synchronize(self.device)
+        f1 = None
+        try:
+            self.profiler.start(sleep_sec=2)
+            torch.cuda.synchronize(self.device)
 
-        self.it = iter(self.dataloader)
-        res, gbuffer = [], None
-        event2, event3 = torch.cuda.Event(), torch.cuda.Event()
-        one_time_events = [torch.cuda.Event() for _ in range(3)]
-        f1 = self.ex.submit(self._h2d_transfer, 0)
+            self.it = iter(self.dataloader)
+            res, gbuffer = self.statistics, None
+            event2, event3 = torch.cuda.Event(), torch.cuda.Event()
+            one_time_events = [torch.cuda.Event() for _ in range(3)]
+            f1 = self.ex.submit(self._h2d_transfer, 0)
 
-        if use_tqdm:
-            iters = tqdm(range(start, n_iter), initial=start)
-        else:
-            iters = range(start, n_iter)
-        for curr_it in iters:
-            self._pre_step(curr_it)
-            data, target, other_meta, event1 = f1.result()
-            if event1 is None:  # means finished
-                break
+            if use_tqdm:
+                iters = tqdm(range(start, n_iter), initial=start)
+            else:
+                iters = range(start, n_iter)
+            for curr_it in iters:
+                self._pre_step(curr_it)
+                data, target, other_meta, event1 = f1.result()
+                if event1 is None:  # means finished
+                    break
 
-            event1.wait(self.model_stream)
+                event1.wait(self.model_stream)
 
-            # prev round gbuffer must have completed since they are in same stream
-            with torch.cuda.stream(self.model_stream):  # type: ignore
-                with self.async_profiling.region("model", curr_it, self.model_stream):
-                    output = self._step(data, target, other_meta, curr_it)
+                # prev round gbuffer must have completed since they are in same stream
+                with torch.cuda.stream(self.model_stream):  # type: ignore
+                    with self.async_profiling.region("model", curr_it, self.model_stream):
+                        output = self._step(data, target, other_meta, curr_it)
 
-            bs = output.shape[0]
-            if gbuffer is None:
-                gbuffer = torch.empty_like(output)
-            event3.wait(self.stream1)
+                bs = output.shape[0]
+                if gbuffer is None:
+                    gbuffer = torch.empty_like(output)
+                event3.wait(self.stream1)
 
-            # loop idx+1: start data transfer
-            f1 = self.ex.submit(self._h2d_transfer, curr_it + 1)
+                # loop idx+1: start data transfer
+                f1 = self.ex.submit(self._h2d_transfer, curr_it + 1)
 
-            # wait idx-1 to prevent to fast CPU submit of tasks
-            event2.synchronize()
+                # wait idx-1 to prevent to fast CPU submit of tasks
+                event2.synchronize()
 
-            # loop idx-1: wait for result transfer
-            event2.wait(self.model_stream)
-            with torch.cuda.stream(self.model_stream):  # type: ignore
-                with self.async_profiling.region("stage", curr_it, self.model_stream):
-                    gbuffer[:bs].copy_(output, non_blocking=True)
-            event3.record(self.model_stream)  # event3: complete copy to gbuffer, can reuse output
+                # loop idx-1: wait for result transfer
+                event2.wait(self.model_stream)
+                with torch.cuda.stream(self.model_stream):  # type: ignore
+                    with self.async_profiling.region("stage", curr_it, self.model_stream):
+                        gbuffer[:bs].copy_(output, non_blocking=True)
+                event3.record(self.model_stream)  # event3: complete copy to gbuffer, can reuse output
 
-            event3.wait(self.stream2)
-            buffer = torch.empty_like(output, pin_memory=True, device="cpu")
-            with torch.cuda.stream(self.stream2):  # type: ignore
-                with self.async_profiling.region("d2h", curr_it, self.stream2):
-                    buffer.copy_(gbuffer[:bs], non_blocking=True)
-            event2.record(self.stream2)    # event2: complete copy to host, can reuse gbuffer
+                event3.wait(self.stream2)
+                buffer = torch.empty_like(output, pin_memory=True, device="cpu")
+                with torch.cuda.stream(self.stream2):  # type: ignore
+                    with self.async_profiling.region("d2h", curr_it, self.stream2):
+                        buffer.copy_(gbuffer[:bs], non_blocking=True)
+                event2.record(self.stream2)    # event2: complete copy to host, can reuse gbuffer
 
-            # one-time event used in async post-step
-            event4 = one_time_events[curr_it % len(one_time_events)]
-            # it should have been synced, but for safety we sync again
-            event4.synchronize()
-            event4.record(self.stream2)
+                # one-time event used in async post-step
+                event4 = one_time_events[curr_it % len(one_time_events)]
+                # it should have been synced, but for safety we sync again
+                event4.synchronize()
+                event4.record(self.stream2)
 
-            post = self.ex2.submit(self._post_step_async, res, buffer, target, other_meta, curr_it, event4)
-            self._completed_step(curr_it, post)
-            self.profiler.step()
+                self._check_completed_posts()
+                post = self.ex2.submit(self._post_step_async, res, buffer, target, other_meta, curr_it, event4)
+                self.pending_posts.append(post)
+                if self._completed_step(curr_it, post):
+                    break
+                self.profiler.step()
 
-        torch.cuda.synchronize(self.device)
-        self.profiler.stop()
-        self.ex.shutdown(wait=True)
-        self.ex2.shutdown(wait=True)
-        _release_cuda_graph_state(self)
+        finally:
+            # Drain all owners even when an earlier cleanup reports an error.
+            with ExitStack() as cleanup:
+                cleanup.callback(_release_cuda_graph_state, self)
+                cleanup.callback(setattr, self, "it", None)
+                cleanup.callback(self.profiler.stop)
+                cleanup.callback(torch.cuda.synchronize, self.device)
+                cleanup.callback(self.ex2.shutdown, wait=True)
+                cleanup.callback(self.ex.shutdown, wait=True)
+                for pending in self.pending_posts:
+                    cleanup.callback(pending.result)
+                if f1 is not None:
+                    cleanup.callback(f1.result)
 
         return res
+
+    def _check_completed_posts(self):
+        # Surface completed task failures without blocking normal overlap.
+        while self.pending_posts and self.pending_posts[0].done():
+            self.pending_posts.popleft().result()
 
     def _completed_step(self, curr_it, post):
         # Subclasses may commit state before another update is submitted.
@@ -237,6 +278,12 @@ class _SyncBase:
 
         self.profiler = profiler
         self.valid = True
+        self.signal = 0
+        self.global_step = 0
+        self.consumed_batches = 0
+        self.statistics = []
+        self.pause_requested = False
+        self.checkpoint_path = None
 
         assert num_normal_steps >= 12
         self.num_normal_steps = num_normal_steps
@@ -256,40 +303,54 @@ class _SyncBase:
     def _post_step(self, res, buffer, target, other_meta, curr_it):
         raise NotImplementedError
 
+    def _check_completed_posts(self):
+        # Synchronous execution has no pending statistics tasks.
+        pass
+
+    def _completed_step(self, curr_it, post):
+        # Inference has no pause persistence contract.
+        return False
+
     def run(self, n_iter=99999999, start=0, use_tqdm=True) -> list:
         assert self.valid, "Can only use once, re-init class"
         self.valid = False
         self._init()
 
-        self.profiler.start(sleep_sec=2)
-        torch.cuda.synchronize(self.device)
-
-        res = []
-        it = iter(self.dataloader)
-
-        if use_tqdm:
-            iters = tqdm(range(start, n_iter), initial=start)
-        else:
-            iters = range(start, n_iter)
-        for curr_it in iters:
-            data, target, other_meta = next(it)
-            # print(data.ravel()[:3], target.ravel()[:3], other_meta[:3])
-            self._pre_step(curr_it)
-            data = data.to(self.device)
-            if self.move_target:
-                target = target.to(self.device)
-
-            with torch.cuda.stream(self.model_stream):  # type: ignore
-                output = self._step(data, target, other_meta, curr_it)
+        try:
+            self.profiler.start(sleep_sec=2)
             torch.cuda.synchronize(self.device)
-            buffer = output.cpu()
 
-            self._post_step(res, buffer, target, other_meta, curr_it)
-            self.profiler.step()
+            res = self.statistics
+            it = iter(self.dataloader)
 
-        torch.cuda.synchronize(self.device)
-        self.profiler.stop()
-        _release_cuda_graph_state(self)
+            if use_tqdm:
+                iters = tqdm(range(start, n_iter), initial=start)
+            else:
+                iters = range(start, n_iter)
+            for curr_it in iters:
+                data, target, other_meta = next(it)
+                # print(data.ravel()[:3], target.ravel()[:3], other_meta[:3])
+                self._pre_step(curr_it)
+                data = data.to(self.device)
+                if self.move_target:
+                    target = target.to(self.device)
+
+                with torch.cuda.stream(self.model_stream):  # type: ignore
+                    output = self._step(data, target, other_meta, curr_it)
+                torch.cuda.synchronize(self.device)
+                buffer = output.cpu()
+
+                self._post_step(res, buffer, target, other_meta, curr_it)
+                if self._completed_step(curr_it, None):
+                    break
+                self.profiler.step()
+
+        finally:
+            # Complete all synchronous cleanup steps even after failure.
+            with ExitStack() as cleanup:
+                cleanup.callback(_release_cuda_graph_state, self)
+                cleanup.callback(self.profiler.stop)
+                cleanup.callback(torch.cuda.synchronize, self.device)
 
         return res
 
@@ -387,6 +448,65 @@ class InferenceMixin:
         raise NotImplementedError
 
 class TrainMixin:
+    def get_project_state(self) -> dict:
+        # Projects export rank-local state at a completed boundary.
+        return {}
+
+    def load_project_state(self, state: dict) -> None:
+        # Empty state is the default project contract.
+        if state:
+            raise ValueError("Override load_project_state for nonempty project state")
+
+    def restore_training_state(self):
+        # Project runtimes restore before iterator creation.
+        pass
+
+    def save_pause_checkpoint(self) -> str:
+        # Low-level runtimes must supply their persistence implementation.
+        raise NotImplementedError("Implement save_pause_checkpoint before requesting pause")
+
+    def _completed_step(self, curr_it, post):
+        # Coordinate requests at the same boundary on all ranks.
+        self.consumed_batches = curr_it + 1
+        self.global_step += int(self.update_completed)
+        request = self.signal if self.distributed.is_main else 0
+        if self.distributed.enabled:
+            control = torch.tensor(request, device=self.device)
+            torch.distributed.broadcast(control, src=0)
+            request = control.item()
+        if not request or not self.update_completed:
+            return False
+        if post is not None:
+            post.result()
+            self._check_completed_posts()
+        torch.cuda.synchronize(self.device)
+        self.checkpoint_path = self.save_pause_checkpoint()
+        self.pause_requested = True
+        return True
+
+    def run(self, n_iter=99999999, start=0, use_tqdm=True) -> TrainResult:
+        # Restore after project initialization and before any data prefetch.
+        self.run_failed = False
+        try:
+            self.restore_training_state()
+            start = max(start, self.consumed_batches)
+            statistics = super().run(n_iter=n_iter, start=start, use_tqdm=use_tqdm)
+        except BaseException:
+            self.run_failed = True
+            raise
+        finally:
+            self.close_training_resources()
+        if self.pause_requested:
+            self.signal = 0
+        return TrainResult(
+            "paused" if self.pause_requested else "completed", self.global_step,
+            self.consumed_batches, self.checkpoint_path, statistics,
+        )
+
+    def close_training_resources(self):
+        # External runtimes retain ownership of their process groups.
+        pass
+
     def _init(self: TrainProto):
         """Initialize train graph state."""
         # Put the model in training mode and clear graph state.

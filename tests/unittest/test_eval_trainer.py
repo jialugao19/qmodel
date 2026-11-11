@@ -156,7 +156,7 @@ def check_train():
         model1, dataloader1, nn.MSELoss(), optim1, sched1, scaler1, profiler1, device, num_normal_steps1)
     trainer1._post_step = _post_step_train
     trainer1._pre_step = lambda a: a  # type: ignore
-    res1 = trainer1.run(n_iter=n_sample//bs)
+    res1 = trainer1.run(n_iter=n_sample//bs).statistics
 
     # model2
 
@@ -167,7 +167,7 @@ def check_train():
         model2, dataloader2, nn.MSELoss(), optim2, sched2, scaler2, profiler2, device, num_normal_steps2)
     trainer2._post_step = _post_step_train
     trainer2._pre_step = lambda a: a  # type: ignore
-    res2 = trainer2.run(n_iter=n_sample//bs)
+    res2 = trainer2.run(n_iter=n_sample//bs).statistics
 
     # Compare loss traces and final model parameters exactly.
     r1 = torch.utils.data.default_collate(res1)

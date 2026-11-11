@@ -103,11 +103,11 @@ GPU 正式训练前, 用代表性输入测量 batch 等待、H2D、计算和端�
 
 顶层 checkpoint 写入 `root_dir/ckpt/iter_<global_step>.pt`. `global_step` 是已完成的 optimizer 更新次数; Torch AMP 跳过更新时不增加计数, 已消费 batch 位置单独记录. `num_iters` 保持原有 batch 执行预算语义.
 
-设置 `trainer.signal = 1` 后, Trainer 在当前完整更新结束后保存, 成功后清零并继续训练. DDP 仅由 rank 0 设置该属性. `signal=0` 不触发额外保存. 原有 `save_every` 保留, 同一步多个保存请求合并. 保存先写同目录临时文件, fsync 后原子 rename; 写入失败直接报错, 不清零 signal.
+设置 `trainer.signal = 1` 后, Trainer 在当前完整更新结束后保存, 成功保存并有序收尾后清零, 返回暂停结果. 调用方退出专用训练进程后才完整释放 CUDA context. DDP 仅由 rank 0 设置该属性. `signal=0` 不触发暂停. 原有 `save_every` 保留, 同一步多个保存请求合并. 保存先写同目录临时文件, fsync 后原子 rename; 写入失败直接报错, 不清零 signal.
 
 启动时使用传入的 `root_dir` 查找已提交文件, 自动选择最大 `global_step` 的 Checkpoint, 从其 config 构建训练对象. 不需要恢复参数, `load_from_iter` 不再控制 Trainer 自动恢复. 无 Checkpoint 时按传入配置启动. 临时文件不参与选择, 已提交文件损坏或缺少必要字段直接报错, 不回退到旧文件.
 
-新格式保存 config、model、optimizer、scheduler、AMP、global_step、实际消费 batch 位置, 以及各 rank 的模型 buffers、Python/NumPy/Torch CPU/CUDA RNG 和 sampler 顺序参数. 恢复从下一 batch/更新继续, 不使用 DataLoader 预取推进的位置. 实现见 [trainer.py](qmodel/core/trainer.py) 和 [checkpoint.py](qmodel/components/checkpoint.py).
+新格式保存 config、model、optimizer、scheduler、AMP、global_step、实际消费 batch 位置, 以及各 rank 的模型 buffers、Python/NumPy/Torch CPU/CUDA RNG、sampler 顺序参数、loss 统计窗口和项目扩展状态. 恢复从下一 batch/更新继续, 不使用 DataLoader 预取推进的位置. 实现见 [trainer.py](qmodel/core/trainer.py) 和 [checkpoint.py](qmodel/components/checkpoint.py).
 
 精确续训要求相同代码、数据和分布式布局, Dataset 对相同 indices 返回相同 batch. 不覆盖 worker 内随机数据变换或外部数据状态. CUDA 非确定性算子和 DDP reduction 顺序仍可能产生浮点舍入差异. DDP + CUDA Graph 恢复后先执行计入进度的 eager warmup, 再重新 capture. 旧格式可加载时按其原有 step 前保存语义恢复, 明确提示缺少 RNG 状态, 不保证与连续训练轨迹一致.
 
@@ -117,7 +117,28 @@ GPU 正式训练前, 用代表性输入测量 batch 等待、H2D、计算和端�
 
 不同输出维度、metadata 或评价口径应使用底层 `AsyncInference` 配合项目自己的输出和统计逻辑. 顶层评价不会自动使用 `qeval` 的 finite mask、ties 或分组契约. 具体实现见 [evaluator.py](qmodel/core/evaluator.py).
 
-## 7. 如何验证修改
+## 7. 如何接入暂停和项目状态
+
+0.2.21 改变了 0.2.20 的 signal 语义: `signal=1` 保存并暂停; 定期保存仍继续训练. `Trainer.train()` 和底层 `SyncTrainer.run()` / `AsyncTrainer.run()` 返回 `TrainResult`, 不再直接返回统计列表. 原列表通过 `result.statistics` 访问. Inference 返回类型不变.
+
+结果字段为 `status` (`completed` / `paused`), `global_step`, `consumed_batches`, `checkpoint_path`, `statistics`. 只有保存和收尾成功才返回 paused, 保存或后台任务失败抛出异常并保留请求. Torch AMP 跳步不消费暂停请求. Trainer 创建的 DDP process group 在暂停时销毁; 外部 process group 由调用方负责.
+
+项目可以继承 Trainer, 实现 `get_project_state() -> dict` 和 `load_project_state(state) -> None`, 保存自己的 sampler、generator 和统计窗口. hooks 在每个 rank 调用. 导出必须无副作用, 记录实际消费位置, 不记录预取位置. 内置 sampler/RNG/window 已由 qmodel 保存, 不应重复接管.
+
+项目初始化完成后, 在 train/run 启动阶段恢复状态, 随后才创建 iterator; RNG 最后恢复. 新格式缺少必要状态直接报错. 旧格式允许读取, 明确提示未保存的统计或项目状态, 项目保留其初始化值.
+
+底层训练类另提供 `save_pause_checkpoint() -> str`, 项目在此完成原子持久化并返回路径; 默认未实现, 请求暂停会报错. `restore_training_state()` 用于项目在创建 iterator 前恢复 sampler 等状态. `close_training_resources()` 用于释放项目拥有的资源. DDP 项目必须让所有 rank 进入一致的保存路径, 并传播各 rank 错误. 顶层 Trainer 已实现完整保存流程.
+
+```python
+result = trainer.train()
+if result.status == "paused":
+    # Exit the dedicated training process after inspecting the result.
+    raise SystemExit(0)
+```
+
+结果返回不等于进程退出, 不等于 CUDA context 已释放. 调用方必须结束专用训练进程, 不应拦截暂停后继续使用其 GPU 对象. runtime 实例仍只允许运行一次.
+
+## 8. 如何验证修改
 
 安装开发依赖和上述运行时依赖后, 在仓库根目录运行:
 

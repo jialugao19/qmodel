@@ -1,4 +1,5 @@
 import os
+import multiprocessing
 import random
 import subprocess
 import sys
@@ -28,15 +29,35 @@ class DropoutModel(RuntimeModel):
         return self.net(nn.functional.dropout(data, p=0.2, training=True))
 
 
-class InterruptedTrainer(Trainer):
+class ProjectTrainer(Trainer):
+    def __init__(self, config):
+        # Initialize project state after framework construction.
+        super().__init__(config)
+        self.project_generator = torch.Generator().manual_seed(45)
+        self.project_window = []
+
+    def get_project_state(self):
+        # Serialize the project's independent RNG and rolling window.
+        return {"generator": self.project_generator.get_state(), "window": self.project_window}
+
+    def load_project_state(self, state):
+        # Restore only state owned by this project.
+        self.project_generator.set_state(state["generator"].cpu())
+        self.project_window = state["window"]
+
+    def _post_step(self, res, buffer, target, other_meta, curr_it):
+        # Update project metrics alongside the built-in loss window.
+        super()._post_step(res, buffer, target, other_meta, curr_it)
+        self.project_window.append(torch.rand((), generator=self.project_generator).item())
+        self.project_window = self.project_window[-5:]
+
+
+class InterruptedTrainer(ProjectTrainer):
     def _completed_step(self, curr_it, post):
         # Request a checkpoint after graph capture or eager warmup.
         if curr_it == 13 and self.distributed.is_main:
             self.signal = 1
-        super()._completed_step(curr_it, post)
-        if curr_it == 13:
-            assert self.signal == 0
-            os._exit(0)
+        return super()._completed_step(curr_it, post)
 
 
 def run_segment(root, mode, graph, workers, amp, ddp):
@@ -60,8 +81,17 @@ def run_segment(root, mode, graph, workers, amp, ddp):
     if mode == "resume":
         config.num_iters = 1
         config.learning_rate = 99
-    trainer = (InterruptedTrainer if mode == "stop" else Trainer)(config)
-    trainer.train()
+    trainer = (InterruptedTrainer if mode == "stop" else ProjectTrainer)(config)
+    result = trainer.train()
+    assert not multiprocessing.active_children()
+    if mode == "stop":
+        assert result.status == "paused"
+        assert result.global_step == 14
+        assert result.checkpoint_path is not None
+        assert trainer.signal == 0
+        assert not torch.distributed.is_initialized()
+        return
+    assert result.status == "completed"
     assert trainer.global_step == 30
     if ddp:
         torch.distributed.destroy_process_group()
@@ -177,3 +207,100 @@ def test_amp_skip_keeps_signal(tmp_path):
     assert state["global_step"] == 1
     assert state["progress"]["ranks"][0]["sampler"]["consumed_batches"] == 2
     assert trainer.signal == 0
+
+
+class FailingStateTrainer(Trainer):
+    def get_project_state(self):
+        # Fail serialization without modifying production code.
+        return {"unserializable": lambda: None}
+
+
+def test_pause_failure_drains_threads(tmp_path):
+    # Failed saves must retain the request and close asynchronous workers.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    config = RuntimeConfig()
+    config.distributed = DistributedConfig(enabled=False)
+    config.root_dir = str(tmp_path)
+    config.tensorboard_dir = str(tmp_path / "events")
+    config.num_iters = 3
+    trainer = FailingStateTrainer(config)
+    trainer.signal = 1
+    with pytest.raises(AttributeError):
+        trainer.train()
+    assert trainer.signal == 1
+    assert trainer.it is None
+    with pytest.raises(RuntimeError, match="shutdown"):
+        trainer.ex.submit(int, 1)
+    assert CheckpointSaver.latest(tmp_path) is None
+
+
+@pytest.mark.parametrize("runtime_name", ["sync", "async"])
+@pytest.mark.parametrize("pause_at", [0, 3, 13])
+def test_low_level_pause_boundary(tmp_path, runtime_name, pause_at):
+    # Exercise public persistence hooks in both low-level runtimes.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from qmodel.core.eval_trainer import SyncTrainer, AsyncTrainer
+    from qmodel.components.amp_scaler import MyScaler
+    from qmodel.components.profiler import MyProfiler
+    from qmodel.config import ProfilerConfig
+    runtime = SyncTrainer if runtime_name == "sync" else AsyncTrainer
+
+    class ProjectRuntime(runtime):
+        def _pre_step(self, curr_it):
+            # Request pause at an arbitrary iteration.
+            if curr_it == pause_at:
+                self.signal = 1
+
+        def _post_step(self, res, buffer, target, other_meta, curr_it):
+            # Keep a project-owned metric list.
+            res.append(buffer.item())
+
+        def save_pause_checkpoint(self):
+            # The project owns its low-level persistence format.
+            path = tmp_path / "pause.pt"
+            torch.save({"step": self.global_step, "model": self.model.state_dict(),
+                        "statistics": self.statistics}, path)
+            return str(path)
+
+    model = nn.Linear(4, 1).cuda()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10)
+    batches = [(torch.ones(8, 4).pin_memory(), torch.ones(8, 1).pin_memory(), None)] * 20
+    trainer = ProjectRuntime(
+        model, batches, nn.MSELoss(), optimizer, scheduler,
+        MyScaler("none", torch.float32), MyProfiler(False, ProfilerConfig("none", "")),
+        torch.device("cuda"), 9999,
+    )
+    result = trainer.run(n_iter=20, use_tqdm=False)
+    assert result.status == "paused"
+    assert result.global_step == pause_at + 1
+    assert result.consumed_batches == pause_at + 1
+    assert len(result.statistics) == pause_at + 1
+    assert torch.load(result.checkpoint_path, weights_only=True)["step"] == pause_at + 1
+    assert trainer.signal == 0
+
+
+class FailingPostTrainer(Trainer):
+    def _post_step(self, res, buffer, target, other_meta, curr_it):
+        # Surface background failures before committing pause state.
+        raise RuntimeError('project statistics failed')
+
+
+def test_background_failure_prevents_pause_commit(tmp_path):
+    # A failed statistics task must never produce a successful pause result.
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    config = RuntimeConfig()
+    config.distributed = DistributedConfig(enabled=False)
+    config.root_dir = str(tmp_path)
+    config.tensorboard_dir = str(tmp_path / 'events')
+    config.num_iters = 3
+    trainer = FailingPostTrainer(config)
+    trainer.signal = 1
+    with pytest.raises(RuntimeError, match='project statistics failed'):
+        trainer.train()
+    assert trainer.signal == 1
+    assert trainer.it is None
+    assert CheckpointSaver.latest(tmp_path) is None

@@ -45,8 +45,13 @@ class CheckpointSaver:
                 for key in ("global_step", "progress"):
                     if key not in state:
                         raise ValueError(f"Incomplete checkpoint {path}: missing {key}")
-                if state["format_version"] != 1:
+                if state["format_version"] not in (1, 2):
                     raise ValueError(f"Unsupported checkpoint version: {path}")
+                if state["format_version"] == 2:
+                    for local in state["progress"]["ranks"]:
+                        for key in ("rng", "sampler", "model", "statistics", "project"):
+                            if key not in local:
+                                raise ValueError(f"Incomplete checkpoint {path}: missing {key}")
             candidate = (state.get("global_step", state["iteration"]), path, state)
             if latest is None or candidate[0] > latest[0]:
                 latest = candidate
@@ -60,7 +65,7 @@ class CheckpointSaver:
             "scaler": scaler.state_dict(), "config": self.config,
         }
         if progress is not None:
-            self.ckpt.update(format_version=1, global_step=it, progress=progress)
+            self.ckpt.update(format_version=2, global_step=it, progress=progress)
         path = self.dir / f"iter_{it}.pt"
         with tempfile.NamedTemporaryFile(dir=self.dir, suffix=".tmp", delete=False) as stream:
             temporary = stream.name
